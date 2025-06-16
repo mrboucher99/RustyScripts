@@ -6,15 +6,17 @@ All previous command line arguments are now static flags. ``--force`` forces
 regeneration of existing slist data and ``--pause`` pauses when blank fields
 are encountered. ``--forcepause`` combines ``--pause`` with an interactive
 menu allowing field updates for each missing CMDB value.
+Using ``--force`` together with ``--pause`` automatically enables
+``--forcepause``.
 """
 
 # Script metadata
-__version__ = "3.54"
+__version__ = "3.55"
 __author__ = "Matthew Boucher"
 __created__ = "2025-06-13"
 __updated__ = "2025-06-13"
-__lines__ = 532
-__chars__ = 15621
+__lines__ = 539
+__chars__ = 15784
 
 import sys
 import os
@@ -63,7 +65,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="interactive pause to fill blank fields when encountered",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.force and args.pause:
+        args.forcepause = True
+        args.force = False
+        args.pause = False
+    return args
 
 
 # Configure logging
@@ -600,6 +607,6 @@ if __name__ == "__main__":
 
 ################################################################################
 #                              cmdbdownload                                  #
-#                                Version 3.54                                   #
+#                                Version 3.55                                   #
 ################################################################################
 
