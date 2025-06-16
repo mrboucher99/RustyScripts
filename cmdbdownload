@@ -11,12 +11,12 @@ Using ``--force`` together with ``--pause`` automatically enables
 """
 
 # Script metadata
-__version__ = "3.55"
+__version__ = "3.56"
 __author__ = "Matthew Boucher"
 __created__ = "2025-06-13"
 __updated__ = "2025-06-13"
-__lines__ = 539
-__chars__ = 15784
+__lines__ = 534
+__chars__ = 15638
 
 import sys
 import os
@@ -494,11 +494,6 @@ def main() -> int:
         try:
             proc = subprocess.run(["slist", server], capture_output=True, text=True, check=True, timeout=TIMEOUT)
             lines = proc.stdout.strip().splitlines()
-            print("  ─ CMDB Fields from slist ─")
-            for ln in lines:
-                if any(ln.strip().lower().startswith(f"{f}:") for f in FIELD_ORDER):
-                    print(f"    {ln}")
-            print("  ─ end CMDB Fields ─\n")
             if os.path.isfile(out_path):
                 old = open(out_path).read().strip().splitlines()
                 if old != lines:
@@ -607,6 +602,6 @@ if __name__ == "__main__":
 
 ################################################################################
 #                              cmdbdownload                                  #
-#                                Version 3.55                                   #
+#                                Version 3.56                                   #
 ################################################################################
 
