@@ -2,21 +2,20 @@
 
 """cmdbdownload
 Simplified slist wrapper with CMDB validation.
-All previous command line arguments are now static flags. ``--force`` forces
-regeneration of existing slist data and ``--pause`` pauses when blank fields
-are encountered. ``--forcepause`` combines ``--pause`` with an interactive
-menu allowing field updates for each missing CMDB value and also overwrites
-existing slist output files. Using ``--force`` together with ``--pause``
-automatically enables ``--forcepause``.
+``--force`` regenerates existing slist data and ``--pause`` simply waits when
+blank fields are encountered. ``--forcepause`` combines ``--pause`` with an
+interactive menu for blank fields and overwrites existing output. ``--fullpause``
+opens the same menu without forcing overwrites. Using ``--force`` together with
+``--pause`` automatically enables ``--forcepause``.
 """
 
 # Script metadata
-__version__ = "3.58"
+__version__ = "3.59"
 __author__ = "Matthew Boucher"
 __created__ = "2025-06-13"
 __updated__ = "2025-06-13"
-__lines__ = 539
-__chars__ = 15728
+__lines__ = 546
+__chars__ = 15910
 
 import sys
 import os
@@ -67,6 +66,11 @@ def parse_args() -> argparse.Namespace:
             "interactive pause to fill blank fields when encountered and "
             "overwrite existing slist output"
         ),
+    )
+    parser.add_argument(
+        "--fullpause",
+        action="store_true",
+        help="interactive menu for blank fields without overwriting files",
     )
     args = parser.parse_args()
     if args.force and args.pause:
@@ -320,10 +324,11 @@ def remove_from_input_file(path: str, host: str) -> None:
 
 def main() -> int:
     args = parse_args()
-    global FORCE_OVERWRITE, PAUSE_ON_BLANK, FORCE_PAUSE_MENU
+    global FORCE_OVERWRITE, PAUSE_ON_BLANK, FORCE_PAUSE_MENU, FULL_PAUSE
     FORCE_OVERWRITE = args.force or args.forcepause
     PAUSE_ON_BLANK = args.pause
     FORCE_PAUSE_MENU = args.forcepause
+    FULL_PAUSE = args.fullpause
 
     clear_screen()
     logger.info("Starting cmdbdownload %s", __version__)
@@ -570,7 +575,9 @@ def main() -> int:
 
         fields = pre_display_checks(server, parse_cmdb_fields(lines), out_path)
         missing_fields = [f for f, v in fields.items() if not (v or "").strip()]
-        if FORCE_PAUSE_MENU and missing_fields:
+        if FULL_PAUSE and missing_fields:
+            fields = fix_menu(server, fields, out_path)
+        elif FORCE_PAUSE_MENU and missing_fields:
             fields = fix_menu(server, fields, out_path)
         elif FIX_INTERACTIVE and missing_fields:
             fields = fix_menu(server, fields, out_path)
@@ -607,6 +614,6 @@ if __name__ == "__main__":
 
 ################################################################################
 #                              cmdbdownload                                  #
-#                                Version 3.58                                   #
+#                                Version 3.59                                   #
 ################################################################################
 
