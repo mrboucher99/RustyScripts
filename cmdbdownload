@@ -5,18 +5,18 @@ Simplified slist wrapper with CMDB validation.
 All previous command line arguments are now static flags. ``--force`` forces
 regeneration of existing slist data and ``--pause`` pauses when blank fields
 are encountered. ``--forcepause`` combines ``--pause`` with an interactive
-menu allowing field updates for each missing CMDB value.
-Using ``--force`` together with ``--pause`` automatically enables
-``--forcepause``.
+menu allowing field updates for each missing CMDB value and also overwrites
+existing slist output files. Using ``--force`` together with ``--pause``
+automatically enables ``--forcepause``.
 """
 
 # Script metadata
-__version__ = "3.57"
+__version__ = "3.58"
 __author__ = "Matthew Boucher"
 __created__ = "2025-06-13"
 __updated__ = "2025-06-13"
-__lines__ = 534
-__chars__ = 15602
+__lines__ = 539
+__chars__ = 15728
 
 import sys
 import os
@@ -63,13 +63,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--forcepause",
         action="store_true",
-        help="interactive pause to fill blank fields when encountered",
+        help=(
+            "interactive pause to fill blank fields when encountered and "
+            "overwrite existing slist output"
+        ),
     )
     args = parser.parse_args()
     if args.force and args.pause:
         args.forcepause = True
         args.force = False
         args.pause = False
+    if args.forcepause:
+        args.force = True
     return args
 
 
@@ -316,7 +321,7 @@ def remove_from_input_file(path: str, host: str) -> None:
 def main() -> int:
     args = parse_args()
     global FORCE_OVERWRITE, PAUSE_ON_BLANK, FORCE_PAUSE_MENU
-    FORCE_OVERWRITE = args.force
+    FORCE_OVERWRITE = args.force or args.forcepause
     PAUSE_ON_BLANK = args.pause
     FORCE_PAUSE_MENU = args.forcepause
 
@@ -602,6 +607,6 @@ if __name__ == "__main__":
 
 ################################################################################
 #                              cmdbdownload                                  #
-#                                Version 3.57                                   #
+#                                Version 3.58                                   #
 ################################################################################
 
