@@ -11,12 +11,12 @@ Using ``--force`` together with ``--pause`` automatically enables
 """
 
 # Script metadata
-__version__ = "3.56"
+__version__ = "3.57"
 __author__ = "Matthew Boucher"
 __created__ = "2025-06-13"
 __updated__ = "2025-06-13"
 __lines__ = 534
-__chars__ = 15638
+__chars__ = 15602
 
 import sys
 import os
@@ -99,7 +99,7 @@ def input_with_timeout(prompt: str, timeout: int = 30) -> str:
 
 
 def handle_fix(host: str, current: Dict[str, Optional[str]], missing: List[str]) -> None:
-    print(f"\ud83d\udd27  --fix menu for {host}")
+    print(f"🔧  --fix menu for {host}")
     for fld in missing:
         auto = ""
         if fld == "u_patch_indentifier" and current["u_patch_group"]:
@@ -119,10 +119,10 @@ def fix_menu(host: str, fields: Dict[str, Optional[str]], out_path: str) -> Dict
     while True:
         missing = [f for f, v in fields.items() if not (v or "").strip() or (v or "").strip().lower() in ("n/a",)]
         if not missing:
-            print("\ud83d\udd27  All fields now populated.")
+            print("🔧  All fields now populated.")
             input("Press ENTER to finish fixing… ")
             break
-        print("\n\ud83d\udd27  Missing fields:")
+        print("\n🔧  Missing fields:")
         for i, fld in enumerate(missing, 1):
             print(f"  {i}) {fld}")
         print(f"  {len(missing)+1}) Done\n")
@@ -307,7 +307,7 @@ def remove_from_input_file(path: str, host: str) -> None:
         lines = [ln for ln in lines if ln.lower() != host.lower()]
         with open(path, "w") as fh:
             fh.write("\n".join(lines) + "\n")
-        print(f"\ud83d\uddd1\ufe0f  Server '{host}' removed from openssh.txt")
+        print(f"🗑️  Server '{host}' removed from openssh.txt")
     except Exception:
         print(f"  \u26A0\uFE0F  Could not update '{path}' for '{host}'")
         sys.exit(1)
@@ -374,13 +374,13 @@ def main() -> int:
                     pc += 1
                 except Exception:
                     print(f"  \u26A0\uFE0F  Failed to delete: {fp}")
-        print("\ud83e\uddf9 Purge complete:")
+        print("🧹 Purge complete:")
         print(f"  Deleted {pv} files from {vault_dir}")
         print(f"  Deleted {pc} files from {cmdb_dir} (kept donelist.txt)\n")
         if os.path.isfile(history_file):
             print("\u2705 cmdb-history.txt preserved.\n")
             print("="*100)
-            print("\ud83d\udcdc cmdb-history.txt contents:")
+            print("📜 cmdb-history.txt contents:")
             print("="*100)
             print(open(history_file).read().strip())
             print("="*100 + "\n")
@@ -400,10 +400,10 @@ def main() -> int:
     if RESORT_RANDOM or RESORT_ALPHANUMERIC:
         if RESORT_RANDOM:
             sd = sorted(servers)
-            msg = "\ud83d\udd00 openssh.txt resorted alphabetically"
+            msg = "🔀 openssh.txt resorted alphabetically"
         else:
             sd = sorted(servers, key=alphanumeric_key)
-            msg = "\ud83d\udcbf openssh.txt resorted alphanumerically"
+            msg = "💿 openssh.txt resorted alphanumerically"
         try:
             with open(input_file, "w") as fh:
                 fh.write("\n".join(sd) + "\n")
@@ -590,7 +590,7 @@ def main() -> int:
     )
 
     print("\n" + "="*100)
-    print("\ud83d\udcdc cmdb-history.txt contents:")
+    print("📜 cmdb-history.txt contents:")
     print("="*100)
     print(open(history_file).read().strip())
     print("="*100 + "\n")
@@ -602,6 +602,6 @@ if __name__ == "__main__":
 
 ################################################################################
 #                              cmdbdownload                                  #
-#                                Version 3.56                                   #
+#                                Version 3.57                                   #
 ################################################################################
 
