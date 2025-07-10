@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+
+VERSION = "5.16"
+AUTHOR = "Matthew Boucher"
+CREATED = "2025-06-13"
+UPDATED = "2025-07-03"
+LINES = 2011
+CHARS = 80396
+
+import sys
+import os
+import re
+import subprocess
+import getpass
+import shutil
+import socket
+import ipaddress
+import signal
+import platform
+import time
+import argparse
+import builtins
+import tempfile
+from datetime import datetime
+from typing import List, Set, Dict, Optional, Union, Tuple
+import random
+import logging
+
+def field_is_missing(field: str, value: Optional[str]) -> bool:
+    """Return True if the given field value should be treated as missing."""
+    text = (value or "").strip()
+    low = text.lower()
+    if not text or low in ("none", "n/a", "undefined"):
+        return True
+    if ":" in text:
+        return True
+    if field == "u_internal_support_hours" and "x" not in low:
+        return True
+    if field == "owned_by" and "anthony guevara" in low:
+        return True
+    return False
+
+FULL_PAUSE = False
+PAUSE_ON_BLANK = False
+RANDOMIZE_LIST = False
+FORCE_OVERWRITE = False
+PURGE_ONLY = False
+FIX_INTERACTIVE = False
+VERBOSE = False
+FORCE_PAUSE_MENU = False
+SKIP_LOW_SLIST = False
+VMWARE_MODE = False
+AUTO_RUN_SSETA = False
+TEMP_LIST_FILE = ""
+TEMP_LIST_PATH = "/tmp/cmdbtemp.txt"
+MARK_DONE = False
+REMOTE_MODE = False
+USER_PASSWORD = ""
+SSEARCH_PATH = "/nethome/mboucher3/ssearch"
+
+logger = logging.getLogger(__name__)
+
+def server_prefix(host: str) -> str:
+    """Return the server prefix used for searches."""
+    prefix = host[:6]
+    if prefix and prefix[-1].isdigit():
+        prefix = prefix[:-1]
+    return prefix
+
+def server_predash(host: str) -> str:
+    """Return substring before the first '-' in the host."""
+    if '-' in host:
+        return host.split('-', 1)[0]
+    return host.split('.', 1)[0] if '.' in host else host
+
+def server_nodigits(host: str) -> str:
+    """Return the hostname segment before '.' with digits removed."""
+    prefix = host.split('.', 1)[0]
+    return re.sub(r"\d", "", prefix)
+
+CURRENT_USER = ""
+
+PATCH_ID_FIELD = "u_patch_indentifier"
+
+SSETA_FIELD_MAP: Dict[str, str] = {}
+
+MANUFACTURER_HISTORY: List[str] = []
+
+def record_manufacturer(val: str) -> None:
+    """Store manufacturer in history, keeping only the last five values."""
+    v = val.strip()
+    if not v:
+        return
+    if v in MANUFACTURER_HISTORY:
+        MANUFACTURER_HISTORY.remove(v)
+    MANUFACTURER_HISTORY.insert(0, v)
+    if len(MANUFACTURER_HISTORY) > 5:
+        MANUFACTURER_HISTORY.pop()
+
+ADMIN_MANAGER_FILE = "/nethome/mboucher3/scriptdata/thevault/resources/admin-managerlist.txt"
+ADMIN_MANAGER_MAP: Dict[str, str] = {}
+
+ADMIN_MANAGED_GROUP_FILE = "/nethome/mboucher3/scriptdata/thevault/resources/admin-managed_by_group.txt"
+ADMIN_MANAGED_GROUP_MAP: Dict[str, str] = {}
+
+ADMIN_U_GROUPING_FILE = "/nethome/mboucher3/scriptdata/thevault/resources/admin-u_grouping.txt"
+ADMIN_U_GROUPING_MAP: Dict[str, str] = {}
+
+
+
+def load_admin_manager_map(path: str) -> Dict[str, str]:
+    """Return mapping of admin to manager from the given file."""
+    mapping: Dict[str, str] = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or "," not in line:
+                    continue
+                admin, manager = line.split(",", 1)
+                mapping[admin.strip()] = manager.strip()
+    except Exception as e:
+        dbg(f"Failed to load manager map: {e}")
+    return mapping
+
+
+def load_admin_managed_group_map(path: str) -> Dict[str, str]:
+    """Return mapping of admin to managed_by_group from the given file."""
+    mapping: Dict[str, str] = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or "," not in line:
+                    continue
+                admin, group = line.split(",", 1)
+                mapping[admin.strip()] = group.strip()
+    except Exception as e:
+        dbg(f"Failed to load managed_by_group map: {e}")
+    return mapping
+
+
+def load_admin_u_grouping_map(path: str) -> Dict[str, str]:
+    """Return mapping of admin to u_grouping from the given file."""
+    mapping: Dict[str, str] = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or "," not in line:
+                    continue
+                admin, grouping = line.split(",", 1)
+                mapping[admin.strip()] = grouping.strip()
+    except Exception as e:
+        dbg(f"Failed to load u_grouping map: {e}")
+    return mapping
+
+
+def ensure_admin_manager_pair(managed_by: str, owned_by: str) -> None:
+    """Ensure the admin-manager list contains the given mapping."""
+    m = managed_by.strip()
+    o = owned_by.strip()
+    if not m or not o:
+        return
+    pair_line = f"{m},{o}"
+    if ADMIN_MANAGER_MAP.get(m, "").lower() == o.lower():
+        return
+    try:
+        lines = [ln.strip() for ln in open(ADMIN_MANAGER_FILE)]
+    except Exception:
+        lines = []
+    if any(pair_line.lower() == ln.lower() for ln in lines):
+        return
+    try:
+        with open(ADMIN_MANAGER_FILE, "a") as fh:
+            fh.write(pair_line + "\n")
+        ADMIN_MANAGER_MAP[m] = o
+        dbg(f"Added '{pair_line}' to admin-manager list")
+    except Exception as e:
+        dbg(f"Failed to update admin-manager file: {e}")
+
+FIELD_ORDER = [
+    "category",
+    "classification",
+    "dns_domain",
+    "environment",
+    "managed_by",
+    "managed_by_group",
+    "manufacturer",
+    "monitor",
+    "os",
+    "owned_by",
+    "supported_by",
+    "sys_id",
+    "sys_class_name",
+    "os_version",
+    "u_dr_tier",
+    "u_grouping",
+    "u_gt_inventory",
+    "host_name",
+    "u_ip_address",
+    "virtual",
+    "u_oit_managed",
+    "u_patch_group",
+    PATCH_ID_FIELD,
+    "u_sla_type",
+    "u_tier_level",
+    "u_internal_support_hours",
+]
+
+
+# end of file
