@@ -1,0 +1,2216 @@
+#!/usr/bin/env python3
+
+VERSION = "5.19"
+AUTHOR = "Matthew Boucher"
+CREATED = "2025-06-13"
+UPDATED = "2025-07-12"
+LINES = 2216
+CHARS = 87460
+
+########################################################################
+# Script Name: cmdbdownload
+#
+# Reads:
+#   - /nethome/mboucher3/scriptdata/thevault/resources/admin-managerlist.txt
+#   - /nethome/mboucher3/scriptdata/thevault/resources/admin-managed_by_group.txt
+#   - /nethome/mboucher3/scriptdata/thevault/resources/admin-u_grouping.txt
+#   - /nethome/$USER/scriptdata/thevault/openssh.txt
+#   - /nethome/mboucher3/scriptdata/cmdbdownload/reports/cmdb-missingrecords.txt
+# Writes:
+#   - /nethome/$USER/scriptdata/thevault/slistdata/<server>.txt
+#   - /nethome/$USER/scriptdata/cmdbdownload/donelist.txt
+#   - /nethome/$USER/scriptdata/cmdbdownload/slistmissing.txt
+#   - /nethome/$USER/scriptdata/cmdbdownload/completedslist.txt
+#   - /nethome/$USER/scriptdata/cmdbdownload/missingslistrecords.txt
+#   - /nethome/$USER/scriptdata/cmdbdownload/cmdb-history.txt
+#   - /nethome/$USER/scriptdata/cmdbdownload/last_list.txt
+########################################################################
+
+import sys
+import os
+import re
+import subprocess
+import getpass
+import shutil
+import socket
+import ipaddress
+import signal
+import platform
+import time
+import argparse
+import builtins
+import tempfile
+from datetime import datetime
+from typing import List, Set, Dict, Optional, Union, Tuple
+import random
+import logging
+
+# Helper to determine if a field value is considered missing
+
+def field_is_missing(field: str, value: Optional[str]) -> bool:
+    """Return True if the given field value should be treated as missing."""
+    # u_room_number is optional and never considered missing
+    if field == "u_room_number":
+        return False
+    text = (value or "").strip()
+    low = text.lower()
+    if not text or low in ("none", "n/a", "undefined"):
+        return True
+    if field == "ip_address":
+        # IPv6 addresses may contain ':' but aren't considered missing
+        return False
+    if ":" in text:
+        return True
+    if field == "u_internal_support_hours" and "x" not in low:
+        return True
+    if field == "owned_by" and "anthony guevara" in low:
+        return True
+    return False
+
+# Configuration flags (previously command-line options)
+FULL_PAUSE = False
+PAUSE_ON_BLANK = False
+RANDOMIZE_LIST = False
+FORCE_OVERWRITE = False
+PURGE_ONLY = False
+FIX_INTERACTIVE = False
+VERBOSE = False
+FORCE_PAUSE_MENU = False
+SKIP_LOW_SLIST = False
+VMWARE_MODE = False
+AUTO_RUN_SSETA = False
+TEMP_LIST_FILE = ""
+TEMP_LIST_PATH = "/tmp/cmdbtemp.txt"
+MARK_DONE = False
+REMOTE_MODE = False
+USER_PASSWORD = ""
+TEXT_SKIP = False
+CDSPLIT = False
+APIFIX = False
+SSEARCH_PATH = "/nethome/mboucher3/ssearch"
+REPORTS_DIR = "/nethome/mboucher3/scriptdata/cmdbdownload/reports"
+MISSING_APIFIX_FILE = os.path.join(REPORTS_DIR, "cmdb-missingrecords.txt")
+
+# Logger initialized later in main()
+logger = logging.getLogger(__name__)
+
+# Helper to compute the server prefix (first six characters,
+# minus a trailing digit if present)
+
+def server_prefix(host: str) -> str:
+    """Return the server prefix used for searches."""
+    prefix = host[:6]
+    if prefix and prefix[-1].isdigit():
+        prefix = prefix[:-1]
+    return prefix
+
+# Helper to get text before the first dash in the hostname
+
+def server_predash(host: str) -> str:
+    """Return substring before the first '-' in the host."""
+    if '-' in host:
+        return host.split('-', 1)[0]
+    return host.split('.', 1)[0] if '.' in host else host
+
+# Helper to remove digits from the hostname prefix before the first dot
+
+def server_nodigits(host: str) -> str:
+    """Return the hostname segment before '.' with digits removed."""
+    prefix = host.split('.', 1)[0]
+    return re.sub(r"\d", "", prefix)
+
+# Extract and return the IPv4 portion of an ip_address value
+def extract_ipv4(ip_val: str) -> str:
+    """Return the IPv4 address when both IPv6 and IPv4 are present."""
+    if ":" in ip_val:
+        m = re.search(r"(\b(?:\d{1,3}\.){3}\d{1,3}\b)", ip_val)
+        if m:
+            return m.group(1)
+    return ip_val
+
+# Current user (populated in main)
+CURRENT_USER = ""
+
+# CMDB field name constant for patch identifier
+PATCH_ID_FIELD = "u_patch_indentifier"
+
+# Mapping for field names that differ between sseta arguments and CMDB fields
+# sseta uses the same field names as CMDB; mapping is kept for future differences
+SSETA_FIELD_MAP: Dict[str, str] = {}
+
+# Keep track of recently used manufacturer values
+MANUFACTURER_HISTORY: List[str] = []
+
+# Keep track of recently used managed_by values
+MANAGED_BY_HISTORY: List[str] = []
+
+# Keep track of recently used managed_by_group values
+MANAGED_BY_GROUP_HISTORY: List[str] = []
+
+# Keep track of recently used u_grouping values
+U_GROUPING_HISTORY: List[str] = []
+
+# Keep track of recently used os_version values
+OS_VERSION_HISTORY: List[str] = []
+
+# Track totals for each patch group letter
+PATCH_GROUP_TOTALS: Dict[str, int] = {"A": 0, "B": 0, "C": 0, "D": 0, "CUSTOM": 0}
+
+# Fields that provide a submenu when selected in the fix menu
+SUBMENU_FIELDS = {
+    PATCH_ID_FIELD,
+    "os",
+    "u_patch_group",
+    "environment",
+    "u_dr_tier",
+    "u_tier_level",
+    "u_internal_support_hours",
+    "u_sla_type",
+    "manufacturer",
+    "os_version",
+    "managed_by",
+    "managed_by_group",
+    "u_grouping",
+    "owned_by",
+}
+
+# Fields touched automatically by cmdb-presteps
+PRESTEP_FIELDS = {
+    "manufacturer",
+    "os",
+    "u_patch_group",
+    PATCH_ID_FIELD,
+    "operational_status",
+    "u_gt_inventory",
+    "managed_by",
+    "managed_by_group",
+    "u_grouping",
+    "host_name",
+    "owned_by",
+    "u_dr_tier",
+    "u_tier_level",
+    "ip_address",
+    "u_sla_type",
+    "category",
+    "virtual",
+    "environment",
+    "os_version",
+}
+
+
+def record_manufacturer(val: str) -> None:
+    """Store manufacturer in history, keeping only the last five values."""
+    v = val.strip()
+    if not v:
+        return
+    if v in MANUFACTURER_HISTORY:
+        MANUFACTURER_HISTORY.remove(v)
+    MANUFACTURER_HISTORY.insert(0, v)
+    if len(MANUFACTURER_HISTORY) > 5:
+        MANUFACTURER_HISTORY.pop()
+
+def _record_history(val: str, history: List[str]) -> None:
+    v = val.strip()
+    if not v:
+        return
+    if v in history:
+        history.remove(v)
+    history.insert(0, v)
+    if len(history) > 5:
+        history.pop()
+
+def record_managed_by(val: str) -> None:
+    """Store managed_by in history."""
+    _record_history(val, MANAGED_BY_HISTORY)
+
+def record_managed_by_group(val: str) -> None:
+    """Store managed_by_group in history."""
+    _record_history(val, MANAGED_BY_GROUP_HISTORY)
+
+def record_u_grouping(val: str) -> None:
+    """Store u_grouping in history."""
+    _record_history(val, U_GROUPING_HISTORY)
+
+def record_os_version(val: str) -> None:
+    """Store os_version in history."""
+    _record_history(val, OS_VERSION_HISTORY)
+
+# Mapping of admin to manager loaded from admin-managerlist.txt
+ADMIN_MANAGER_FILE = "/nethome/mboucher3/scriptdata/thevault/resources/admin-managerlist.txt"
+ADMIN_MANAGER_MAP: Dict[str, str] = {}
+
+# Mapping of admin to managed_by_group loaded from admin-managed_by_group.txt
+ADMIN_MANAGED_GROUP_FILE = "/nethome/mboucher3/scriptdata/thevault/resources/admin-managed_by_group.txt"
+ADMIN_MANAGED_GROUP_MAP: Dict[str, str] = {}
+
+# Mapping of admin to u_grouping loaded from admin-u_grouping.txt
+ADMIN_U_GROUPING_FILE = "/nethome/mboucher3/scriptdata/thevault/resources/admin-u_grouping.txt"
+ADMIN_U_GROUPING_MAP: Dict[str, str] = {}
+
+
+def load_admin_manager_map(path: str) -> Dict[str, str]:
+    """Return mapping of admin to manager from the given file."""
+    mapping: Dict[str, str] = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or "," not in line:
+                    continue
+                admin, manager = line.split(",", 1)
+                mapping[admin.strip()] = manager.strip()
+    except Exception as e:
+        dbg(f"Failed to load manager map: {e}")
+    return mapping
+
+
+def load_admin_managed_group_map(path: str) -> Dict[str, str]:
+    """Return mapping of admin to managed_by_group from the given file."""
+    mapping: Dict[str, str] = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or "," not in line:
+                    continue
+                admin, group = line.split(",", 1)
+                mapping[admin.strip()] = group.strip()
+    except Exception as e:
+        dbg(f"Failed to load managed_by_group map: {e}")
+    return mapping
+
+
+def load_admin_u_grouping_map(path: str) -> Dict[str, str]:
+    """Return mapping of admin to u_grouping from the given file."""
+    mapping: Dict[str, str] = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or "," not in line:
+                    continue
+                admin, grouping = line.split(",", 1)
+                mapping[admin.strip()] = grouping.strip()
+    except Exception as e:
+        dbg(f"Failed to load u_grouping map: {e}")
+    return mapping
+
+
+def ensure_admin_manager_pair(managed_by: str, owned_by: str) -> None:
+    """Ensure the admin-manager list contains the given mapping."""
+    m = managed_by.strip()
+    o = owned_by.strip()
+    if not m or not o:
+        return
+    pair_line = f"{m},{o}"
+    # quick check in loaded map
+    if ADMIN_MANAGER_MAP.get(m, "").lower() == o.lower():
+        return
+    try:
+        lines = [ln.strip() for ln in open(ADMIN_MANAGER_FILE)]
+    except Exception:
+        lines = []
+    if any(pair_line.lower() == ln.lower() for ln in lines):
+        return
+    try:
+        with open(ADMIN_MANAGER_FILE, "a") as fh:
+            fh.write(pair_line + "\n")
+        ADMIN_MANAGER_MAP[m] = o
+        dbg(f"Added '{pair_line}' to admin-manager list")
+    except Exception as e:
+        dbg(f"Failed to update admin-manager file: {e}")
+
+# Ordered list of CMDB fields used throughout the script
+FIELD_ORDER = [
+    # Standard Fields
+    "category",
+    "classification",
+    "dns_domain",
+    "environment",
+    "managed_by",
+    "managed_by_group",
+    "manufacturer",
+    "monitor",
+    "os",
+    "owned_by",
+    "supported_by",
+    "sys_id",
+    "sys_class_name",
+    "os_version",
+    # Custom and u_ prefixed Fields
+    "u_dr_tier",
+    "u_grouping",
+    "u_gt_inventory",
+    "host_name",
+    "ip_address",
+    "u_room_number",
+    "virtual",
+    "u_oit_managed",
+    "u_patch_group",
+    PATCH_ID_FIELD,
+    "u_sla_type",
+    "u_tier_level",
+    "u_internal_support_hours",
+    "operational_status",
+]
+
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="cmdbdownload - slist wrapper with CMDB validation"
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="rerun slist even if the slistdata file already exists",
+    )
+    parser.add_argument(
+        "--pause",
+        action="store_true",
+        help="pause until ENTER if any CMDB field is blank or none",
+    )
+    parser.add_argument(
+        "--forcepause",
+        action="store_true",
+        help=(
+            "interactive pause to fill blank fields when encountered and "
+            "overwrite existing slist output"
+        ),
+    )
+    parser.add_argument(
+        "--fullpause",
+        action="store_true",
+        help="interactive menu for blank fields without overwriting files",
+    )
+    parser.add_argument(
+        "--purge",
+        action="store_true",
+        help="delete all files in the slistdata and mlistdata directories and exit",
+    )
+    parser.add_argument(
+        "--random",
+        action="store_true",
+        help="randomize the server list before processing",
+    )
+    parser.add_argument(
+        "--skip",
+        action="store_true",
+        help=(
+            "with --forcepause, skip server if slistdata check "
+            "(first 6 chars, trailing digit removed) is <5"
+        ),
+    )
+    parser.add_argument(
+        "--vmware",
+        action="store_true",
+        help=(
+            "assume servers are VMware VMs and update manufacturer,"" u_gt_inventory, u_sla_type, and category"
+        ),
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="edit a temporary server list in /tmp and use it",
+    )
+    parser.add_argument(
+        "--last",
+        action="store_true",
+        help="use the last temporary list if it exists",
+    )
+    parser.add_argument(
+        "--add",
+        action="store_true",
+        help="append hosts from a temp file to the active list",
+    )
+    parser.add_argument(
+        "--done",
+        action="store_true",
+        help=(
+            "track completed servers in donelist.txt and skip those already listed"
+        ),
+    )
+    parser.add_argument(
+        "--fields",
+        action="store_true",
+        help="display all editable field names and exit",
+    )
+    parser.add_argument(
+        "--remote",
+        action="store_true",
+        help=(
+            "perform SSH-based checks using current user credentials"" only when port 22 is open"
+        ),
+    )
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        help=(
+            "run ssearch once for missing fields then pause for manual fixes"
+        ),
+    )
+    parser.add_argument(
+        "--textskip",
+        action="store_true",
+        help="enable hostname-based skip patterns",
+    )
+    parser.add_argument(
+        "--cdsplit",
+        action="store_true",
+        help="balance patch identifier C and D counts",
+    )
+    parser.add_argument(
+        "--apifix",
+        action="store_true",
+        help=(
+            "run zbxapi and eipapi presteps to record monitoring status "
+            "(password is passed to both; zbxapi is skipped when monitor is false; "
+            "skipped entirely when classification is Retired or patch identifier is X)"
+        ),
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="enable debug-level logging to STDERR",
+    )
+    args = parser.parse_args()
+    if args.force and args.pause:
+        args.forcepause = True
+        args.force = False
+        args.pause = False
+    if args.forcepause:
+        args.force = True
+    return args
+
+
+# Configure logging placeholder; initialized in main()
+
+def dbg(msg: str) -> None:
+    """Output debug messages when verbose mode is active."""
+    if VERBOSE:
+        logger.debug(msg)
+
+# ---- Utility functions ----
+
+def input_with_timeout(prompt: str, timeout: int = 30) -> str:
+    """Prompt the user without any timeout."""
+    return input(prompt)
+
+
+def pause_error(msg: str) -> None:
+    """Display an error message and optionally pause based on flags."""
+    print(msg)
+    if PAUSE_ON_BLANK or FORCE_PAUSE_MENU:
+        input_with_timeout("Error in the script. Press ENTER to continue… ", 5)
+
+
+def run_sseta(host: str, field: str, value: str) -> bool:
+    """Run sseta and report errors with the full command."""
+    real_field = SSETA_FIELD_MAP.get(field, field)
+    cmd = ["sseta", "--fqdn", host, f"--{real_field}", value]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        err = e.stderr.strip() if e.stderr else str(e)
+        pause_error(f"  \u26A0\uFE0F  sseta failed: {err}")
+        print("  Command:", " ".join(cmd))
+        return False
+
+
+def run_ssh_command(host: str, command: str, timeout: int = 30) -> Tuple[str, bool]:
+    """Execute an SSH command with notice before running."""
+    if not REMOTE_MODE:
+        return "", False
+    dbg(f"ssh {host} {command}")
+    ssh_opts = [
+        "sshpass",
+        "-p",
+        USER_PASSWORD,
+        "ssh",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        f"{CURRENT_USER}@{host}",
+        command,
+    ]
+
+    masked = "*" * len(USER_PASSWORD)
+    disp_opts = ssh_opts.copy()
+    if disp_opts[2]:
+        disp_opts[2] = masked
+    cmd_display = " ".join(disp_opts)
+    print("-" * 75)
+    print(f"ALERT: running SSH command: {cmd_display}")
+    print("-" * 75)
+    try:
+        output = subprocess.check_output(ssh_opts, text=True, timeout=timeout)
+        print(f"  SSH '{command}' on {host}: PASS")
+        if output.strip():
+            print(f"    {output.strip()}")
+        return output.strip(), True
+    except subprocess.CalledProcessError as e:
+        msg = e.stderr.strip() if e.stderr else str(e)
+        print(f"  SSH '{command}' on {host}: FAIL ({msg})")
+        return "", False
+    except Exception as e:
+        print(f"  SSH '{command}' on {host}: FAIL ({e})")
+        return "", False
+
+
+def run_ssearch(
+    host: str,
+    length: int = 6,
+    prefix: Optional[str] = None,
+    domain_only: bool = False,
+    append_domain: bool = True,
+) -> None:
+    """Run ``ssearch`` using a derived pattern."""
+
+    if domain_only:
+        domain = host.split(".", 1)[1] if "." in host else host
+        pattern = domain
+    else:
+        if prefix is None:
+            if length == 6:
+                search_prefix = server_prefix(host)
+            else:
+                search_prefix = host[:length]
+        else:
+            search_prefix = prefix
+        if append_domain:
+            domain = host[host.find(".") :] if "." in host else ""
+            pattern = f"{search_prefix}*{domain}"
+        else:
+            pattern = f"{search_prefix}*"
+
+    print(f"  Running: ssearch --s {pattern} --auto")
+    try:
+        subprocess.run([SSEARCH_PATH, "--s", pattern, "--auto"], check=True)
+    except subprocess.CalledProcessError as e:
+        pause_error(f"  \u26A0\uFE0F  ssearch failed: {e}")
+
+
+def update_field(host: str, fields: Dict[str, Optional[str]], fld: str, val: str, out_path: str) -> bool:
+    """Update a single field via sseta and modify the slistdata file."""
+    if not run_sseta(host, fld, val):
+        return False
+    fields[fld] = val
+    if fld == "manufacturer":
+        record_manufacturer(val)
+    elif fld == "managed_by":
+        record_managed_by(val)
+    elif fld == "managed_by_group":
+        record_managed_by_group(val)
+    elif fld == "u_grouping":
+        record_u_grouping(val)
+    elif fld == "os_version":
+        record_os_version(val)
+    lines = open(out_path).readlines()
+    with open(out_path, "w") as fh:
+        written = False
+        for line in lines:
+            if line.lower().startswith(f"{fld.lower()}:"):
+                fh.write(f"{fld}: {val}\n")
+                written = True
+            else:
+                fh.write(line)
+        if not written:
+            fh.write(f"{fld}: {val}\n")
+    print(f"    \u2714 {fld} set to '{val}'")
+    if fld == "owned_by":
+        managed = fields.get("managed_by") or ""
+        ensure_admin_manager_pair(managed, val)
+    if fld == "u_patch_group":
+        pid_val = ""
+        if val.strip().upper() == "CUSTOM":
+            pid_val = "CUSTOM"
+        elif "=" in val:
+            pid_val = val.split("=", 1)[0].replace(" ", "")
+        if pid_val:
+            if run_sseta(host, PATCH_ID_FIELD, pid_val):
+                fields[PATCH_ID_FIELD] = pid_val
+                lines = open(out_path).readlines()
+                with open(out_path, "w") as fh2:
+                    pid_written = False
+                    for line in lines:
+                        if line.lower().startswith(f"{PATCH_ID_FIELD}:"):
+                            fh2.write(f"{PATCH_ID_FIELD}: {pid_val}\n")
+                            pid_written = True
+                        elif line.lower().startswith(f"{fld.lower()}:"):
+                            fh2.write(f"{fld}: {val}\n")
+                        else:
+                            fh2.write(line)
+                    if not pid_written:
+                        fh2.write(f"{PATCH_ID_FIELD}: {pid_val}\n")
+                print(f"    \u2714 {PATCH_ID_FIELD} set to '{pid_val}'")
+    return True
+
+
+def manual_menu(host: str, fields: Dict[str, Optional[str]], out_path: str) -> Tuple[Dict[str, Optional[str]], bool]:
+    """Manual field entry submenu."""
+    changed = False
+    while True:
+        print("\nManual field entry:")
+        for i, fld in enumerate(FIELD_ORDER, 1):
+            val = fields.get(fld) or "<BLANK>"
+            if fld == "ip_address" and val != "<BLANK>":
+                val = extract_ipv4(val)
+            print(f"  {i}) {fld} [{val}]")
+        print("  0) return\n")
+        sel = input("Select field number: ").strip()
+        if sel in ("", "0"):
+            break
+        if not sel.isdigit() or not (1 <= int(sel) <= len(FIELD_ORDER)):
+            print("  \u26A0\uFE0F  Invalid selection.")
+            continue
+        fld = FIELD_ORDER[int(sel) - 1]
+        val = input(f"Enter value for {fld}: ").strip()
+        if val:
+            if update_field(host, fields, fld, val, out_path):
+                changed = True
+    return fields, changed
+
+
+def pre_slist_owner_fix(host: str, out_path: str) -> None:
+    """Clear 'owned_by' field if it contains Anthony Guevara before slist."""
+    if not os.path.isfile(out_path):
+        return
+    lines = open(out_path).read().splitlines()
+    fields = parse_cmdb_fields(lines)
+    owned_val = (fields.get("owned_by") or "").lower()
+    if "anthony guevara" in owned_val:
+        if run_sseta(host, "owned_by", ""):
+            new_lines = []
+            written = False
+            for line in lines:
+                if line.lower().startswith("owned_by:"):
+                    new_lines.append("owned_by:")
+                    written = True
+                else:
+                    new_lines.append(line)
+            if not written:
+                new_lines.append("owned_by:")
+            with open(out_path, "w") as fh:
+                fh.write("\n".join(new_lines))
+            dbg("Cleared owned_by containing Anthony Guevara before slist")
+
+
+
+def handle_fix(host: str, current: Dict[str, Optional[str]], missing: List[str]) -> None:
+    print(f"�  --fix menu for {host}")
+    for fld in missing:
+        auto = ""
+        if fld == PATCH_ID_FIELD and current["u_patch_group"]:
+            auto = current["u_patch_group"].split()[-1]
+        val = input_with_timeout(f"  > {fld} [{auto}]: ", 60).strip() or auto
+        if val:
+            if run_sseta(host, fld, val):
+                print(f"    \u2714 {fld} set to '{val}'")
+    print()
+
+
+def fix_menu(host: str, fields: Dict[str, Optional[str]], out_path: str) -> Tuple[Dict[str, Optional[str]], bool, bool]:
+    """Interactive menu for fixing blank fields.
+
+    Returns a tuple of the updated fields, a boolean indicating if the caller
+    should restart processing for this host, and a boolean showing if any field
+    was changed by the user.
+    """
+    global FORCE_PAUSE_MENU
+    changed = False
+    while True:
+        loop_changed = False
+        missing = [
+            f
+            for f, v in fields.items()
+            if field_is_missing(f, v)
+        ]
+        if not missing:
+            print("�  All fields now populated.")
+            if FORCE_PAUSE_MENU or PAUSE_ON_BLANK:
+                print()
+                time.sleep(2)
+            break
+        print("\n�  Missing fields:")
+        for i, fld in enumerate(missing, 1):
+            notes = []
+            if fld in SUBMENU_FIELDS:
+                notes.append("submenu")
+            if fld in PRESTEP_FIELDS:
+                notes.append("prestep")
+            note_text = f" ({', '.join(notes)})" if notes else ""
+            print(f"  {i}) {fld}{note_text}")
+        print("  r) repeat checks")
+        print("  s) ssearch on prefix*domain (first 6)")
+        print("  t) ssearch on prefix*domain (first 5)")
+        print("  -) ssearch on text-before-dash*domain")
+        if "ad.gatech.edu" not in host:
+            print("  d) ssearch on domain")
+        print("  n) ssearch on nodigit prefix")
+        print("  m) manual field entry")
+        if FORCE_PAUSE_MENU or PAUSE_ON_BLANK:
+            print("  Hit ENTER to continue\n")
+        choice = input(
+            f"Select field to set [1-{len(missing)}] (ENTER to continue): "
+        ).strip().lower()
+        if not choice:
+            break
+        if choice == 'r':
+            # Remove existing slist output so the next iteration reruns all
+            # checks from the beginning for this host
+            if os.path.isfile(out_path):
+                try:
+                    os.remove(out_path)
+                except OSError:
+                    pass
+            return fields, True, changed
+        if choice == 's':
+            run_ssearch(host, 6)
+            continue
+        if choice == 't':
+            run_ssearch(host, 5)
+            continue
+        if choice == '-':
+            run_ssearch(host, prefix=server_predash(host))
+            continue
+        if choice == 'd':
+            if "ad.gatech.edu" not in host:
+                run_ssearch(host, domain_only=True)
+            else:
+                print("  \u26A0\uFE0F  Domain search disabled for ad.gatech.edu")
+            continue
+        if choice == 'n':
+            run_ssearch(host, prefix=server_nodigits(host), append_domain=False)
+            continue
+        if choice == 'm':
+            fields, chg = manual_menu(host, fields, out_path)
+            if chg:
+                changed = True
+            continue
+        if not choice.isdigit() or not (1 <= int(choice) <= len(missing)):
+            print("  \u26A0\uFE0F  Invalid choice.")
+            if FORCE_PAUSE_MENU or PAUSE_ON_BLANK:
+                input("Press ENTER to continue… ")
+            continue
+        idx = int(choice)
+        if 1 <= idx <= len(missing):
+            fld = missing[idx - 1]
+            if fld == PATCH_ID_FIELD:
+                opts = {
+                    "A": "A",
+                    "B": "B",
+                    "C": "C",
+                    "D": "D",
+                    "0": "CUSTOM",
+                }
+                print("  Patch identifier options:")
+                for key in ["A", "B", "C", "D", "0"]:
+                    print(f"    {key}) {opts[key]}")
+                sel = input("Select option [A-D/0]: ").strip().upper()
+                if sel not in opts:
+                    print("  \u26A0\uFE0F  Invalid option.")
+                    if FORCE_PAUSE_MENU or PAUSE_ON_BLANK:
+                        input("Press ENTER to continue… ")
+                    continue
+                val = opts[sel]
+            elif fld == "os":
+                opts = [
+                    "Linux Red Hat",
+                    "Linux Ubuntu",
+                    "Windows Server",
+                    "Cisco Systems",
+                ]
+                print("  OS options:")
+                for n, opt in enumerate(opts, 1):
+                    print(f"    {n}) {opt}")
+                print("    m) manual entry")
+                sel = input("Select option [1-4/m]: ").strip().lower()
+                if sel == "m":
+                    val = input("Enter value for os: ").strip()
+                    if not val:
+                        continue
+                elif sel.isdigit() and 1 <= int(sel) <= len(opts):
+                    val = opts[int(sel) - 1]
+                else:
+                    print("  \u26A0\uFE0F  Invalid option.")
+                    if FORCE_PAUSE_MENU or PAUSE_ON_BLANK:
+                        input("Press ENTER to continue… ")
+                    continue
+            elif fld == "u_patch_group":
+                global PATCH_GROUP_TOTALS
+                if PATCH_GROUP_TOTALS.get("C", 0) <= PATCH_GROUP_TOTALS.get("D", 0):
+                    least_letter = "C"
+                else:
+                    least_letter = "D"
+                opts = {
+                    "A": "A = 1st Thursday after Patch Tuesday",
+                    "B": "B = 2nd Thursday after Patch Tuesday",
+                    "C": "C = 3rd Thursday after Patch Tuesday",
+                    "D": "D = 4th Thursday after Patch Tuesday",
+                    "0": "CUSTOM",
+                    "P": "ProdFLIP (least used of C/D)",
+                }
+                print("  Patch group options:")
+                for key in ["A", "B", "C", "D", "0", "P"]:
+                    text = opts[key]
+                    if key == "P":
+                        text += f" -> {least_letter}"
+                    print(f"    {key}) {text}")
+                sel = input("Select option [A-D/0/P]: ").strip().upper()
+                if sel == "P":
+                    sel = least_letter
+                if sel not in opts:
+                    print("  \u26A0\uFE0F  Invalid option.")
+                    if FORCE_PAUSE_MENU or PAUSE_ON_BLANK:
+                        input("Press ENTER to continue… ")
+                    continue
+                val = opts[sel]
+            elif fld == "environment":
+                opts = ["Production", "Test", "Development"]
+                print("  Environment options:")
+                for n, opt in enumerate(opts, 1):
+                    print(f"    {n}) {opt}")
+                sel = input("Select option [1-3]: ").strip()
+                if not sel.isdigit() or not (1 <= int(sel) <= len(opts)):
+                    print("  \u26A0\uFE0F  Invalid option.")
+                    if FORCE_PAUSE_MENU or PAUSE_ON_BLANK:
+                        input("Press ENTER to continue… ")
+                    continue
+                val = opts[int(sel) - 1]
+            elif fld == "u_dr_tier":
+                opts = ["DR Tier 1", "DR Tier 2", "DR Tier 3", "DR Tier 4"]
+                print("  u_dr_tier options:")
+                for n, opt in enumerate(opts, 1):
+                    print(f"    {n}) {opt}")
+                print("    x) move on")
+                sel = input("Select option [1-4/x]: ").strip().lower()
+                if sel == "x" or not sel:
+                    continue
+                if not sel.isdigit() or not (1 <= int(sel) <= len(opts)):
+                    print("  \u26A0\uFE0F  Invalid option.")
+                    if FORCE_PAUSE_MENU or PAUSE_ON_BLANK:
+                        input("Press ENTER to continue… ")
+                    continue
+                val = opts[int(sel) - 1]
+            elif fld == "u_tier_level":
+                opts = ["DR Tier 1", "DR Tier 2", "DR Tier 3", "DR Tier 4"]
+                print("  u_tier_level options:")
+                for n, opt in enumerate(opts, 1):
+                    print(f"    {n}) {opt}")
+                print("    x) move on")
+                sel = input("Select option [1-4/x]: ").strip().lower()
+                if sel == "x" or not sel:
+                    continue
+                if not sel.isdigit() or not (1 <= int(sel) <= len(opts)):
+                    print("  \u26A0\uFE0F  Invalid option.")
+                    if FORCE_PAUSE_MENU or PAUSE_ON_BLANK:
+                        input("Press ENTER to continue… ")
+                    continue
+                val = opts[int(sel) - 1]
+            elif fld == "u_internal_support_hours":
+                opts = ["24x7", "8x5", "16x7"]
+                print("  u_internal_support_hours options:")
+                for n, opt in enumerate(opts, 1):
+                    print(f"    {n}) {opt}")
+                sel = input("Select option [1-3]: ").strip()
+                if not sel.isdigit() or not (1 <= int(sel) <= len(opts)):
+                    print("  \u26A0\uFE0F  Invalid option.")
+                    if FORCE_PAUSE_MENU or PAUSE_ON_BLANK:
+                        input("Press ENTER to continue… ")
+                    continue
+                val = opts[int(sel) - 1]
+            elif fld == "u_sla_type":
+                opts = [
+                    "vm-managed",
+                    "vm-non-managed",
+                    "physical-managed",
+                    "physical-non-managed",
+                ]
+                print("  u_sla_type options:")
+                for n, opt in enumerate(opts, 1):
+                    print(f"    {n}) {opt}")
+                sel = input("Select option [1-4]: ").strip()
+                if not sel.isdigit() or not (1 <= int(sel) <= len(opts)):
+                    print("  \u26A0\uFE0F  Invalid option.")
+                    if FORCE_PAUSE_MENU or PAUSE_ON_BLANK:
+                        input("Press ENTER to continue… ")
+                    continue
+                val = opts[int(sel) - 1]
+            elif fld == "manufacturer":
+                if MANUFACTURER_HISTORY:
+                    print("  manufacturer options:")
+                    for n, opt in enumerate(MANUFACTURER_HISTORY, 1):
+                        print(f"    {n}) {opt}")
+                    manual_num = len(MANUFACTURER_HISTORY) + 1
+                    print(f"    {manual_num}) manual entry")
+                    sel = input(f"Select option [1-{manual_num}]: ").strip()
+                    if not sel:
+                        continue
+                    if sel.isdigit() and 1 <= int(sel) <= len(MANUFACTURER_HISTORY):
+                        val = MANUFACTURER_HISTORY[int(sel) - 1]
+                    elif sel.isdigit() and int(sel) == manual_num:
+                        val = input("Enter value for manufacturer: ").strip()
+                    else:
+                        print("  \u26A0\uFE0F  Invalid option.")
+                        if FORCE_PAUSE_MENU or PAUSE_ON_BLANK:
+                            input("Press ENTER to continue… ")
+                        continue
+                else:
+                    val = input("Enter value for manufacturer: ").strip()
+            elif fld == "os_version":
+                print("  os_version options:")
+                if OS_VERSION_HISTORY:
+                    print("    r) running list")
+                print("    m) manual entry")
+                print("    ENTER to return\n")
+                sel = input("Select option [r/m]: ").strip().lower()
+                if not sel:
+                    continue
+                if sel == "r" and OS_VERSION_HISTORY:
+                    for n, opt in enumerate(OS_VERSION_HISTORY, 1):
+                        print(f"    {n}) {opt}")
+                    pick = input(f"Select number [1-{len(OS_VERSION_HISTORY)}]: ").strip()
+                    if not pick.isdigit() or not (1 <= int(pick) <= len(OS_VERSION_HISTORY)):
+                        print("  \u26A0\uFE0F  Invalid option.")
+                        if FORCE_PAUSE_MENU or PAUSE_ON_BLANK:
+                            input("Press ENTER to continue… ")
+                        continue
+                    val = OS_VERSION_HISTORY[int(pick) - 1]
+                elif sel == "m":
+                    val = input("Enter value for os_version: ").strip()
+                else:
+                    print("  \u26A0\uFE0F  Invalid option.")
+                    if FORCE_PAUSE_MENU or PAUSE_ON_BLANK:
+                        input("Press ENTER to continue… ")
+                    continue
+            elif fld == "managed_by":
+                print("  managed_by options:")
+                if MANAGED_BY_HISTORY:
+                    print("    r) running list")
+                print("    m) manual entry")
+                print("    ENTER to return\n")
+                sel = input("Select option [r/m]: ").strip().lower()
+                if not sel:
+                    continue
+                if sel == "r" and MANAGED_BY_HISTORY:
+                    for n, opt in enumerate(MANAGED_BY_HISTORY, 1):
+                        print(f"    {n}) {opt}")
+                    pick = input(f"Select number [1-{len(MANAGED_BY_HISTORY)}]: ").strip()
+                    if not pick.isdigit() or not (1 <= int(pick) <= len(MANAGED_BY_HISTORY)):
+                        print("  \u26A0\uFE0F  Invalid option.")
+                        if FORCE_PAUSE_MENU or PAUSE_ON_BLANK:
+                            input("Press ENTER to continue… ")
+                        continue
+                    val = MANAGED_BY_HISTORY[int(pick) - 1]
+                elif sel == "m":
+                    val = input("Enter value for managed_by: ").strip()
+                else:
+                    print("  \u26A0\uFE0F  Invalid option.")
+                    if FORCE_PAUSE_MENU or PAUSE_ON_BLANK:
+                        input("Press ENTER to continue… ")
+                    continue
+            elif fld == "managed_by_group":
+                print("  managed_by_group options:")
+                if MANAGED_BY_GROUP_HISTORY:
+                    print("    r) running list")
+                print("    m) manual entry")
+                print("    ENTER to return\n")
+                sel = input("Select option [r/m]: ").strip().lower()
+                if not sel:
+                    continue
+                if sel == "r" and MANAGED_BY_GROUP_HISTORY:
+                    for n, opt in enumerate(MANAGED_BY_GROUP_HISTORY, 1):
+                        print(f"    {n}) {opt}")
+                    pick = input(f"Select number [1-{len(MANAGED_BY_GROUP_HISTORY)}]: ").strip()
+                    if not pick.isdigit() or not (1 <= int(pick) <= len(MANAGED_BY_GROUP_HISTORY)):
+                        print("  \u26A0\uFE0F  Invalid option.")
+                        if FORCE_PAUSE_MENU or PAUSE_ON_BLANK:
+                            input("Press ENTER to continue… ")
+                        continue
+                    val = MANAGED_BY_GROUP_HISTORY[int(pick) - 1]
+                elif sel == "m":
+                    val = input("Enter value for managed_by_group: ").strip()
+                else:
+                    print("  \u26A0\uFE0F  Invalid option.")
+                    if FORCE_PAUSE_MENU or PAUSE_ON_BLANK:
+                        input("Press ENTER to continue… ")
+                    continue
+            elif fld == "u_grouping":
+                print("  u_grouping options:")
+                if U_GROUPING_HISTORY:
+                    print("    r) running list")
+                print("    m) manual entry")
+                print("    ENTER to return\n")
+                sel = input("Select option [r/m]: ").strip().lower()
+                if not sel:
+                    continue
+                if sel == "r" and U_GROUPING_HISTORY:
+                    for n, opt in enumerate(U_GROUPING_HISTORY, 1):
+                        print(f"    {n}) {opt}")
+                    pick = input(f"Select number [1-{len(U_GROUPING_HISTORY)}]: ").strip()
+                    if not pick.isdigit() or not (1 <= int(pick) <= len(U_GROUPING_HISTORY)):
+                        print("  \u26A0\uFE0F  Invalid option.")
+                        if FORCE_PAUSE_MENU or PAUSE_ON_BLANK:
+                            input("Press ENTER to continue… ")
+                        continue
+                    val = U_GROUPING_HISTORY[int(pick) - 1]
+                elif sel == "m":
+                    val = input("Enter value for u_grouping: ").strip()
+                else:
+                    print("  \u26A0\uFE0F  Invalid option.")
+                    if FORCE_PAUSE_MENU or PAUSE_ON_BLANK:
+                        input("Press ENTER to continue… ")
+                    continue
+            elif fld == "owned_by":
+                mgmt_val = fields.get("managed_by") or ""
+                print("  owned_by options:")
+                print(f"    1) managed_by value [{mgmt_val}]")
+                print("    m) manual entry")
+                print("    ENTER to return\n")
+                sel = input("Select option [1/m]: ").strip().lower()
+                if not sel:
+                    continue
+                if sel == "1":
+                    val = mgmt_val
+                elif sel == "m":
+                    val = input("Enter value for owned_by: ").strip()
+                else:
+                    print("  \u26A0\uFE0F  Invalid option.")
+                    if FORCE_PAUSE_MENU or PAUSE_ON_BLANK:
+                        input("Press ENTER to continue… ")
+                    continue
+            else:
+                val = input(f"Enter value for {fld}: ").strip()
+            if val:
+                if run_sseta(host, fld, val):
+                    if fld == "manufacturer":
+                        record_manufacturer(val)
+                    elif fld == "managed_by":
+                        record_managed_by(val)
+                    elif fld == "managed_by_group":
+                        record_managed_by_group(val)
+                    elif fld == "u_grouping":
+                        record_u_grouping(val)
+                    fields[fld] = val
+                    changed = True
+                    loop_changed = True
+                    lines = open(out_path).readlines()
+                    with open(out_path, "w") as fh:
+                        for line in lines:
+                            if line.lower().startswith(f"{fld.lower()}:"):
+                                fh.write(f"{fld}: {val}\n")
+                            else:
+                                fh.write(line)
+                    print(f"    \u2714 {fld} set to '{val}'")
+                    if fld == "manufacturer":
+                        try:
+                            slout = subprocess.check_output(
+                                ["slist", host], text=True, timeout=10
+                            ).splitlines()
+                            manu_line = next(
+                                (ln for ln in slout if ln.lower().startswith("manufacturer:")),
+                                None,
+                            )
+                            if manu_line:
+                                sl_val = manu_line.split(":", 1)[1].strip()
+                                if sl_val.lower() == val.lower():
+                                    print("      \u2714 manufacturer verified via slist")
+                                else:
+                                    print(
+                                        f"      \u26A0\uFE0F  slist shows '{sl_val}', expected '{val}'"
+                                    )
+                            else:
+                                print("      \u26A0\uFE0F  manufacturer not found in slist output")
+                        except Exception as e:
+                            print(f"      \u26A0\uFE0F  slist verification failed: {e}")
+                    if fld == "u_patch_group":
+                        pid_val = ""
+                        if val.strip().upper() == "CUSTOM":
+                            pid_val = "CUSTOM"
+                        elif "=" in val:
+                            pid_val = val.split("=", 1)[0].replace(" ", "")
+                        if pid_val:
+                            if run_sseta(host, PATCH_ID_FIELD, pid_val):
+                                fields[PATCH_ID_FIELD] = pid_val
+                                loop_changed = True
+                                lines = open(out_path).readlines()
+                                with open(out_path, "w") as fh:
+                                    pid_written = False
+                                    for line in lines:
+                                        if line.lower().startswith(f"{PATCH_ID_FIELD}:"):
+                                            fh.write(f"{PATCH_ID_FIELD}: {pid_val}\n")
+                                            pid_written = True
+                                        elif line.lower().startswith(f"{fld.lower()}:"):
+                                            fh.write(f"{fld}: {val}\n")
+                                        else:
+                                            fh.write(line)
+                                    if not pid_written:
+                                        fh.write(f"{PATCH_ID_FIELD}: {pid_val}\n")
+                                print(f"    \u2714 {PATCH_ID_FIELD} set to '{pid_val}'")
+        else:
+            print("  \u26A0\uFE0F  Choice out of range.")
+        if (FORCE_PAUSE_MENU or PAUSE_ON_BLANK) and not loop_changed:
+            input("Press ENTER to continue… ")
+    return fields, False, changed
+
+
+def pre_display_checks(
+    host: str, fields: Dict[str, Optional[str]], out_path: str, port_22_ok: bool
+) -> Tuple[Dict[str, Optional[str]], List[str]]:
+    updates: List[str] = []
+    # Blank owned_by if it still contains the outdated value
+    owned_val = (fields.get("owned_by") or "").lower()
+    if "anthony guevara" in owned_val:
+        if run_sseta(host, "owned_by", ""):
+            updates.append("owned_by")
+            fields["owned_by"] = ""
+            lines = open(out_path).readlines()
+            written = False
+            with open(out_path, "w") as fh:
+                for line in lines:
+                    if line.lower().startswith("owned_by:"):
+                        fh.write("owned_by:\n")
+                        written = True
+                    else:
+                        fh.write(line)
+                if not written:
+                    fh.write("owned_by:\n")
+            dbg("Cleared owned_by containing Anthony Guevara after slist")
+
+    # Auto-fill host_name using the prefix of the server name when missing
+    if field_is_missing("host_name", fields.get("host_name")):
+        remote_name = host.split(".")[0]
+        print(f"  Running command: sseta --fqdn {host} --host_name {remote_name}")
+        if run_sseta(host, "host_name", remote_name):
+            updates.append("host_name")
+            fields["host_name"] = remote_name
+            lines = open(out_path).readlines()
+            written = False
+            with open(out_path, "w") as fh:
+                for line in lines:
+                    if line.lower().startswith("host_name:"):
+                        fh.write(f"host_name: {remote_name}\n")
+                        written = True
+                    else:
+                        fh.write(line)
+                if not written:
+                    fh.write(f"host_name: {remote_name}\n")
+        dbg(f"Auto-filled host_name with '{remote_name}'")
+    # Autopopulate u_patch_indentifier from u_patch_group when possible
+    pid = (fields.get(PATCH_ID_FIELD) or "").strip()
+    pgrp = (fields.get("u_patch_group") or "").strip()
+    auto_pid = ""
+    prefix = ""
+    if pgrp:
+        if "=" in pgrp:
+            prefix = pgrp.split("=", 1)[0].replace(" ", "")
+        elif pgrp.strip().upper() == "CUSTOM":
+            prefix = "CUSTOM"
+    if not pid and prefix:
+        auto_pid = prefix
+    elif FORCE_OVERWRITE and prefix and prefix != pid:
+        auto_pid = prefix
+    if auto_pid:
+        if run_sseta(host, PATCH_ID_FIELD, auto_pid):
+            updates.append(PATCH_ID_FIELD)
+            fields[PATCH_ID_FIELD] = auto_pid
+            lines = open(out_path).readlines()
+            written = False
+            with open(out_path, "w") as fh:
+                for line in lines:
+                    if line.lower().startswith(f"{PATCH_ID_FIELD}:"):
+                        fh.write(f"{PATCH_ID_FIELD}: {auto_pid}\n")
+                        written = True
+                    else:
+                        fh.write(line)
+                if not written:
+                    fh.write(f"{PATCH_ID_FIELD}: {auto_pid}\n")
+            dbg(f"Auto-filled {PATCH_ID_FIELD} with '{auto_pid}'")
+
+    desired_inv = f"vm-{host.replace('.gatech.edu', '')}"
+    if fields.get("u_gt_inventory") != desired_inv:
+        if run_sseta(host, "u_gt_inventory", desired_inv):
+            updates.append("u_gt_inventory")
+            fields["u_gt_inventory"] = desired_inv
+            lines = open(out_path).readlines()
+            written = False
+            with open(out_path, "w") as fh:
+                for line in lines:
+                    if line.lower().startswith("u_gt_inventory:"):
+                        fh.write(f"u_gt_inventory: {desired_inv}\n")
+                        written = True
+                    else:
+                        fh.write(line)
+                if not written:
+                    fh.write(f"u_gt_inventory: {desired_inv}\n")
+            dbg(f"Set u_gt_inventory to '{desired_inv}'")
+
+    if VMWARE_MODE:
+        manufacturer = "VMware, Inc."
+        if fields.get("manufacturer") != manufacturer:
+            if run_sseta(host, "manufacturer", manufacturer):
+                record_manufacturer(manufacturer)
+                updates.append("manufacturer")
+                fields["manufacturer"] = manufacturer
+                lines = open(out_path).readlines()
+                written = False
+                with open(out_path, "w") as fh:
+                    for line in lines:
+                        if line.lower().startswith("manufacturer:"):
+                            fh.write(f"manufacturer: {manufacturer}\n")
+                            written = True
+                        else:
+                            fh.write(line)
+                    if not written:
+                        fh.write(f"manufacturer: {manufacturer}\n")
+                dbg(f"Set manufacturer to '{manufacturer}' via --vmware")
+
+        sla_val = fields.get("u_sla_type") or ""
+        if "physical-" in sla_val.lower():
+            new_sla = re.sub("(?i)physical-", "vm-", sla_val)
+            if run_sseta(host, "u_sla_type", new_sla):
+                updates.append("u_sla_type")
+                fields["u_sla_type"] = new_sla
+                lines = open(out_path).readlines()
+                written = False
+                with open(out_path, "w") as fh:
+                    for line in lines:
+                        if line.lower().startswith("u_sla_type:"):
+                            fh.write(f"u_sla_type: {new_sla}\n")
+                            written = True
+                        else:
+                            fh.write(line)
+                    if not written:
+                        fh.write(f"u_sla_type: {new_sla}\n")
+                dbg(f"Updated u_sla_type to '{new_sla}' via --vmware")
+
+        desired_cat = "vmware"
+        if fields.get("category") != desired_cat:
+            if run_sseta(host, "category", desired_cat):
+                updates.append("category")
+                fields["category"] = desired_cat
+                lines = open(out_path).readlines()
+                written = False
+                with open(out_path, "w") as fh:
+                    for line in lines:
+                        if line.lower().startswith("category:"):
+                            fh.write(f"category: {desired_cat}\n")
+                            written = True
+                        else:
+                            fh.write(line)
+                    if not written:
+                        fh.write(f"category: {desired_cat}\n")
+                dbg(f"Set category to '{desired_cat}' via --vmware")
+
+        virt_field = "virtual"
+        virt_val = fields.get(virt_field) or ""
+        if not virt_val.strip():
+            if run_sseta(host, virt_field, "true"):
+                updates.append(virt_field)
+                fields[virt_field] = "true"
+                lines = open(out_path).readlines()
+                written = False
+                with open(out_path, "w") as fh:
+                    for line in lines:
+                        if line.lower().startswith(f"{virt_field.lower()}:"):
+                            fh.write(f"{virt_field}: true\n")
+                            written = True
+                        else:
+                            fh.write(line)
+                    if not written:
+                        fh.write(f"{virt_field}: true\n")
+                dbg(f"Set {virt_field} to 'true' via --vmware")
+
+    inv_val = fields.get("u_gt_inventory") or ""
+    if ".sw.gatech.edu" in host and "vm-" in inv_val.lower():
+        new_inv = "Network Device"
+        if run_sseta(host, "u_gt_inventory", new_inv):
+            updates.append("u_gt_inventory")
+            fields["u_gt_inventory"] = new_inv
+            lines = open(out_path).readlines()
+            written = False
+            with open(out_path, "w") as fh:
+                for line in lines:
+                    if line.lower().startswith("u_gt_inventory:"):
+                        fh.write(f"u_gt_inventory: {new_inv}\n")
+                        written = True
+                    else:
+                        fh.write(line)
+                if not written:
+                    fh.write(f"u_gt_inventory: {new_inv}\n")
+            dbg(f"Set u_gt_inventory to '{new_inv}' for network device")
+
+    # Auto-set manufacturer when missing for ESX hosts
+    if not (fields.get("manufacturer") or "").strip() and "esx.gatech.edu" in host:
+        manufacturer = "VMware, Inc."
+        if run_sseta(host, "manufacturer", manufacturer):
+            record_manufacturer(manufacturer)
+            updates.append("manufacturer")
+            fields["manufacturer"] = manufacturer
+            lines = open(out_path).readlines()
+            written = False
+            with open(out_path, "w") as fh:
+                for line in lines:
+                    if line.lower().startswith("manufacturer:"):
+                        fh.write(f"manufacturer: {manufacturer}\n")
+                        written = True
+                    else:
+                        fh.write(line)
+                if not written:
+                    fh.write(f"manufacturer: {manufacturer}\n")
+            dbg(f"Set manufacturer to '{manufacturer}' for ESX host")
+
+    inv_val = fields.get("u_gt_inventory") or ""
+    if (not VMWARE_MODE) and not (fields.get("manufacturer") or "").strip() and "vm-" in inv_val.lower():
+        manufacturer = "VMware, Inc."
+        if run_sseta(host, "manufacturer", manufacturer):
+            record_manufacturer(manufacturer)
+            updates.append("manufacturer")
+            fields["manufacturer"] = manufacturer
+            lines = open(out_path).readlines()
+            written = False
+            with open(out_path, "w") as fh:
+                for line in lines:
+                    if line.lower().startswith("manufacturer:"):
+                        fh.write(f"manufacturer: {manufacturer}\n")
+                        written = True
+                    else:
+                        fh.write(line)
+                if not written:
+                    fh.write(f"manufacturer: {manufacturer}\n")
+            dbg(f"Set manufacturer to '{manufacturer}'")
+
+    # Auto-populate ip_address when missing
+    if not (fields.get("ip_address") or "").strip():
+        try:
+            host_out = subprocess.check_output(["host", host], text=True, timeout=5)
+            match = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", host_out)
+            if match:
+                ip_val = match.group(0)
+                if run_sseta(host, "ip_address", ip_val):
+                    updates.append("ip_address")
+                    fields["ip_address"] = ip_val
+                    lines = open(out_path).readlines()
+                    written = False
+                    with open(out_path, "w") as fh:
+                        for line in lines:
+                            if line.lower().startswith("ip_address:"):
+                                fh.write(f"ip_address: {ip_val}\n")
+                                written = True
+                            else:
+                                fh.write(line)
+                        if not written:
+                            fh.write(f"ip_address: {ip_val}\n")
+                    dbg(f"Set ip_address to '{ip_val}' via host command")
+        except Exception as e:
+            dbg(f"host lookup failed: {e}")
+
+    # Auto-set u_dr_tier based on environment when missing
+    if not (fields.get("u_dr_tier") or "").strip():
+        env_val = (fields.get("environment") or "").lower()
+        tier_val = ""
+        if "production" in env_val:
+            tier_val = "DR tier 1"
+        elif "test" in env_val:
+            tier_val = "DR tier 3"
+        elif "development" in env_val:
+            tier_val = "DR tier 4"
+        if tier_val:
+            if run_sseta(host, "u_dr_tier", tier_val):
+                updates.append("u_dr_tier")
+                fields["u_dr_tier"] = tier_val
+                lines = open(out_path).readlines()
+                written = False
+                with open(out_path, "w") as fh:
+                    for line in lines:
+                        if line.lower().startswith("u_dr_tier:"):
+                            fh.write(f"u_dr_tier: {tier_val}\n")
+                            written = True
+                        else:
+                            fh.write(line)
+                if not written:
+                    fh.write(f"u_dr_tier: {tier_val}\n")
+                dbg(f"Auto-set u_dr_tier to '{tier_val}' based on environment")
+
+    # Ensure u_tier_level matches u_dr_tier without the 'DR' prefix
+    tier_val = (fields.get("u_dr_tier") or "").strip()
+    if tier_val:
+        level_val = tier_val
+        if level_val.lower().startswith("dr "):
+            level_val = level_val[3:].strip()
+        current_level = (fields.get("u_tier_level") or "").strip()
+        if not current_level or current_level.lower() != level_val.lower():
+            if run_sseta(host, "u_tier_level", level_val):
+                updates.append("u_tier_level")
+                fields["u_tier_level"] = level_val
+                lines = open(out_path).readlines()
+                written = False
+                with open(out_path, "w") as fh:
+                    for line in lines:
+                        if line.lower().startswith("u_tier_level:"):
+                            fh.write(f"u_tier_level: {level_val}\n")
+                            written = True
+                        else:
+                            fh.write(line)
+                    if not written:
+                        fh.write(f"u_tier_level: {level_val}\n")
+                dbg(f"Updated u_tier_level to '{level_val}' from u_dr_tier")
+
+    mgr_key = (fields.get("managed_by") or "").strip()
+    manager = ADMIN_MANAGER_MAP.get(mgr_key)
+    if manager and (fields.get("owned_by") or "").strip() != manager:
+        if run_sseta(host, "owned_by", manager):
+            updates.append("owned_by")
+            fields["owned_by"] = manager
+            lines = open(out_path).readlines()
+            written = False
+            with open(out_path, "w") as fh:
+                for line in lines:
+                    if line.lower().startswith("owned_by:"):
+                        fh.write(f"owned_by: {manager}\n")
+                        written = True
+                    else:
+                        fh.write(line)
+                if not written:
+                    fh.write(f"owned_by: {manager}\n")
+            dbg(f"Set owned_by to '{manager}' from admin-manager list")
+            ensure_admin_manager_pair(mgr_key, manager)
+
+    grp_key = (fields.get("managed_by") or "").strip()
+    group = ADMIN_MANAGED_GROUP_MAP.get(grp_key)
+    if group and field_is_missing("managed_by_group", fields.get("managed_by_group")):
+        if run_sseta(host, "managed_by_group", group):
+            updates.append("managed_by_group")
+            fields["managed_by_group"] = group
+            lines = open(out_path).readlines()
+            written = False
+            with open(out_path, "w") as fh:
+                for line in lines:
+                    if line.lower().startswith("managed_by_group:"):
+                        fh.write(f"managed_by_group: {group}\n")
+                        written = True
+                    else:
+                        fh.write(line)
+                if not written:
+                    fh.write(f"managed_by_group: {group}\n")
+            dbg(f"Set managed_by_group to '{group}' from admin-managed_by_group list")
+
+    grp_key = (fields.get("managed_by") or "").strip()
+    grouping = ADMIN_U_GROUPING_MAP.get(grp_key)
+    if grouping and field_is_missing("u_grouping", fields.get("u_grouping")):
+        if run_sseta(host, "u_grouping", grouping):
+            updates.append("u_grouping")
+            fields["u_grouping"] = grouping
+            lines = open(out_path).readlines()
+            written = False
+            with open(out_path, "w") as fh:
+                for line in lines:
+                    if line.lower().startswith("u_grouping:"):
+                        fh.write(f"u_grouping: {grouping}\n")
+                        written = True
+                    else:
+                        fh.write(line)
+                if not written:
+                    fh.write(f"u_grouping: {grouping}\n")
+            dbg(f"Set u_grouping to '{grouping}' from admin-u_grouping list")
+
+    for fld, val in fields.items():
+        vs = (val or "").strip().lower()
+        if vs == "" or vs in ("none", "n/a", "undefined"):
+            default = ""
+            if fld == "environment":
+                default = (
+                    "Development" if "dev" in host else
+                    "Test" if "test" in host else
+                    "Production" if "prod" in host else ""
+                )
+            if default:
+                if run_sseta(host, fld, default):
+                    updates.append(fld)
+                    fields[fld] = default
+    if REMOTE_MODE and port_22_ok and (
+        field_is_missing("sys_class_name", fields.get("sys_class_name"))
+        or field_is_missing("os_version", fields.get("os_version"))
+    ):
+        uname_out, ok = run_ssh_command(host, "uname -a", timeout=30)
+        if not ok:
+            uname_out = ""
+        default_os = ""
+        if any(tag in uname_out for tag in ("el6", "el7", "el8", "el9")):
+            print(uname_out)
+            print(f"Script Version: {VERSION}")
+            default_os = "Linux Red Hat"
+        elif "Ubuntu" in uname_out:
+            print(uname_out)
+            print(f"Script Version: {VERSION}")
+            default_os = "Ubuntu Linux"
+        if default_os and field_is_missing("os", fields.get("os")):
+            if run_sseta(host, "os", default_os):
+                updates.append("os")
+                fields["os"] = default_os
+                dbg(f"Auto-detected OS set to '{default_os}'")
+            lines = open(out_path).readlines()
+            with open(out_path, "w") as fh:
+                for line in lines:
+                    if line.lower().startswith("os:"):
+                        fh.write(f"os: {default_os}\n")
+                    else:
+                        fh.write(line)
+    return fields, updates
+
+
+SKIP_PREFIXES = ["jerry", "jec-", "fit-"]
+SPECIAL_PREFIXES = ["isilon", "switch"]
+BIGIQ_NETWORKS = [
+    ipaddress.IPv4Network("130.207.176.0/24"),
+    ipaddress.IPv4Network("10.137.42.0/24"),
+    ipaddress.IPv4Network("130.207.181.0/24"),
+    ipaddress.IPv4Network("10.138.42.0/24"),
+]
+MYF5LABS_NETWORKS = [
+    ipaddress.IPv4Network("143.215.79.0/24"),
+    ipaddress.IPv4Network("10.138.51.0/24"),
+]
+
+
+def is_port_22_open(host: str) -> bool:
+    try:
+        conn = socket.create_connection((host, 22), timeout=2)
+        conn.close()
+        return True
+    except (socket.timeout, socket.error):
+        return False
+
+
+def is_port_3389_open(host: str) -> bool:
+    try:
+        conn = socket.create_connection((host, 3389), timeout=2)
+        conn.close()
+        return True
+    except (socket.timeout, socket.error):
+        return False
+
+
+def is_pingable(host: str) -> bool:
+    plat = platform.system().lower()
+    cmd = ["ping", "-n", "1", "-w", "1000", host] if plat.startswith("win") else ["ping", "-c", "1", "-W", "1", host]
+    try:
+        return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    except Exception:
+        return False
+
+
+def purge_files(directory: str) -> int:
+    deleted = 0
+    if not os.path.isdir(directory):
+        return 0
+    for fname in os.listdir(directory):
+        fpath = os.path.join(directory, fname)
+        if os.path.isfile(fpath):
+            try:
+                os.remove(fpath)
+                deleted += 1
+            except OSError as err:
+                pause_error(f"  \u26A0\uFE0F  Failed to delete: {fpath} ({err})")
+    return deleted
+
+
+def clear_screen() -> None:
+    if os.name == "nt":
+        subprocess.call(["cls"], shell=True)
+    elif shutil.which("clear"):
+        subprocess.call(["clear"])
+
+
+def read_lines_from_file(path: str) -> Set[str]:
+    try:
+        return {ln.strip() for ln in open(path) if ln.strip()}
+    except Exception:
+        return set()
+
+
+def deduplicate_hosts(hosts: List[str]) -> List[str]:
+    """Return host list without case-insensitive duplicates."""
+    deduped = []
+    seen = set()
+    for h in hosts:
+        k = h.lower()
+        if k not in seen:
+            deduped.append(h)
+            seen.add(k)
+    return deduped
+
+
+def deduplicate_file(path: str) -> None:
+    """Remove duplicate lines from a file, preserving order."""
+    if not os.path.isfile(path):
+        return
+    lines = [ln.strip() for ln in open(path) if ln.strip()]
+    deduped = deduplicate_hosts(lines)
+    if len(deduped) != len(lines):
+        with open(path, "w") as fh:
+            fh.write("\n".join(deduped) + "\n")
+        print(f"Removed {len(lines) - len(deduped)} duplicate host(s) from {path}")
+
+def alert_no_pause(triggered: bool, reason: str) -> None:
+    """Inform the user when --forcepause didn't pause."""
+    if FORCE_PAUSE_MENU and not triggered:
+        print(f"\u26A0\ufe0f  --forcepause: did not pause because {reason}")
+
+
+def parse_cmdb_fields(lines: List[str]) -> Dict[str, Optional[str]]:
+    """Parse key/value pairs from ``slist`` output.
+
+    The previous implementation searched the entire text with a regex that
+    assumed the next field name contained only letters and underscores.  Some
+    ``slist`` fields use spaces or other characters in their labels, which
+    caused values like ``host_name`` to bleed into the following label.
+
+    This version processes the output line by line and extracts any ``key:
+    value`` pairs found on the line.  It still handles multiple fields on a
+    single line but no longer relies on guessing the format of the next label,
+    preventing accidental inclusion of the next line's text in a value.
+    """
+
+    result = {fld: None for fld in FIELD_ORDER}
+    field_pattern = re.compile(r"([A-Za-z_]+):\s*(.*?)\s*(?=\b[A-Za-z_]+:|$)", re.IGNORECASE)
+
+    for line in lines:
+        for key, val in field_pattern.findall(line):
+            key_l = key.lower()
+            for fld in FIELD_ORDER:
+                if key_l == fld.lower():
+                    result[fld] = val.strip()
+                    if fld == "os_version":
+                        record_os_version(val.strip())
+                    break
+
+    return result
+
+
+def remove_from_input_file(path: str, host: str) -> None:
+    try:
+        lines = [ln.strip() for ln in open(path) if ln.strip()]
+        lines = [ln for ln in lines if ln.lower() != host.lower()]
+        with open(path, "w") as fh:
+            fh.write("\n".join(lines) + "\n")
+        base = os.path.basename(path)
+        print(f"�️  Server '{host}' removed from {base}")
+    except Exception:
+        pause_error(f"  \u26A0\uFE0F  Could not update '{path}' for '{host}'")
+        sys.exit(1)
+
+
+def done_list_skip(server: str, idx: int, total: int, donelist: Set[str]) -> bool:
+    """Return True and alert if server is on the done list."""
+    if MARK_DONE and server in donelist:
+        print(
+            f"[{idx}/{total}] {server} \u2192 \u26a0\ufe0f  {server} is on the done list; skipping."
+        )
+        return True
+    return False
+
+
+def main() -> int:
+    args = parse_args()
+    global FORCE_OVERWRITE, PAUSE_ON_BLANK, FORCE_PAUSE_MENU, FULL_PAUSE, VERBOSE, PURGE_ONLY, RANDOMIZE_LIST, SKIP_LOW_SLIST, VMWARE_MODE, AUTO_RUN_SSETA, TEMP_LIST_FILE, MARK_DONE, REMOTE_MODE, USER_PASSWORD, TEXT_SKIP, CDSPLIT, APIFIX
+    FORCE_OVERWRITE = args.force or args.forcepause
+    PAUSE_ON_BLANK = args.pause
+    FORCE_PAUSE_MENU = args.forcepause
+    FULL_PAUSE = args.fullpause
+    PURGE_ONLY = args.purge
+    VERBOSE = args.verbose
+    RANDOMIZE_LIST = args.random
+    SKIP_LOW_SLIST = args.skip
+    VMWARE_MODE = args.vmware
+    AUTO_RUN_SSETA = args.auto
+    TEXT_SKIP = args.textskip
+    CDSPLIT = args.cdsplit
+    APIFIX = args.apifix
+    MARK_DONE = args.done
+    REMOTE_MODE = args.remote
+
+    global logger
+    logging.basicConfig(
+        level=logging.DEBUG if VERBOSE else logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+    logger = logging.getLogger(__name__)
+
+    clear_screen()
+    logger.info("Starting cmdbdownload %s", globals().get("VERSION", ""))
+    for cmd in ("slist", "sseta", "ping"):
+        if not shutil.which(cmd):
+            pause_error(f"ERROR: Required command '{cmd}' not found in PATH.")
+            return 1
+    if not (os.path.isfile(SSEARCH_PATH) and os.access(SSEARCH_PATH, os.X_OK)):
+        pause_error(f"ERROR: ssearch not found at {SSEARCH_PATH}")
+        return 1
+    banner_center = f"#         cmdbdownload v{globals().get('VERSION', '')}             #"
+    banner_line = "#" * len(banner_center)
+    print(banner_line)
+    print(banner_center)
+    print(banner_line + "\n")
+
+    # Display argument status
+    all_args = [
+        "force",
+        "pause",
+        "forcepause",
+        "fullpause",
+        "purge",
+        "random",
+        "verbose",
+        "skip",
+        "vmware",
+        "auto",
+        "textskip",
+        "cdsplit",
+        "apifix",
+        "list",
+        "last",
+        "add",
+        "done",
+        "fields",
+        "remote",
+    ]
+    print("Arguments status:")
+    for arg in all_args:
+        status = "ON" if getattr(args, arg) else "off"
+        print(f"  --{arg:<10}{status}")
+    print()
+
+    # Display the editable CMDB fields handled by this script
+    print("Editable fields:")
+    for fld in FIELD_ORDER:
+        print(f"  {fld}")
+    print()
+
+    if args.fields:
+        return 0
+
+    TIMEOUT = int(os.getenv("CMDB_TIMEOUT", "3"))
+    MIN_LINES = 10
+
+    global CURRENT_USER, USER_PASSWORD
+    CURRENT_USER = getpass.getuser()
+    print(f"Current user: {CURRENT_USER}")
+    if REMOTE_MODE or APIFIX:
+        USER_PASSWORD = getpass.getpass(f"Password for {CURRENT_USER}: ")
+
+    base_dir = os.path.join("/nethome", CURRENT_USER, "scriptdata")
+    vault_dir = os.path.join(base_dir, "thevault", "slistdata")
+    mlist_dir = os.path.join(base_dir, "thevault", "mlistdata")
+    cmdb_dir = os.path.join(base_dir, "cmdbdownload")
+    os.makedirs(vault_dir, exist_ok=True)
+    os.makedirs(mlist_dir, exist_ok=True)
+    os.makedirs(cmdb_dir, exist_ok=True)
+    for d in (vault_dir, mlist_dir, cmdb_dir):
+        if not os.access(d, os.W_OK):
+            pause_error(f"ERROR: No write permission to {d}")
+            return 1
+
+    global ADMIN_MANAGER_MAP, ADMIN_MANAGED_GROUP_MAP, ADMIN_U_GROUPING_MAP
+    ADMIN_MANAGER_MAP = load_admin_manager_map(ADMIN_MANAGER_FILE)
+    ADMIN_MANAGED_GROUP_MAP = load_admin_managed_group_map(ADMIN_MANAGED_GROUP_FILE)
+    ADMIN_U_GROUPING_MAP = load_admin_u_grouping_map(ADMIN_U_GROUPING_FILE)
+    fail_file = os.path.join(cmdb_dir, "slistmissing.txt")
+    complete_file = os.path.join(cmdb_dir, "completedslist.txt")
+    missing_slist_file = os.path.join(cmdb_dir, "missingslistrecords.txt")
+    history_file = os.path.join(cmdb_dir, "cmdb-history.txt")
+    donelist_file = os.path.join(cmdb_dir, "donelist.txt")
+    main_list = os.path.join(base_dir, "thevault", "openssh.txt")
+    input_file = main_list
+
+    last_record = os.path.join(cmdb_dir, "last_list.txt")
+    if args.last:
+        if os.path.isfile(TEMP_LIST_PATH):
+            TEMP_LIST_FILE = TEMP_LIST_PATH
+        else:
+            args.list = True
+    if args.list:
+        TEMP_LIST_FILE = TEMP_LIST_PATH
+        if not os.path.isfile(TEMP_LIST_FILE):
+            open(TEMP_LIST_FILE, "w").close()
+        subprocess.call([os.getenv("EDITOR", "vi"), TEMP_LIST_FILE])
+        with open(last_record, "w") as fh:
+            fh.write(TEMP_LIST_FILE + "\n")
+    if args.list or args.last:
+        input_file = TEMP_LIST_FILE
+
+    if args.add:
+        add_tf = tempfile.NamedTemporaryFile(delete=False, dir="/tmp", prefix="cmdb_add_", suffix=".txt")
+        add_path = add_tf.name
+        add_tf.close()
+        subprocess.call([os.getenv("EDITOR", "vi"), add_path])
+        new_hosts = [ln.strip() for ln in open(add_path) if ln.strip()]
+        target = input_file if (args.list or args.last) else main_list
+        if new_hosts:
+            with open(target, "a") as fh:
+                fh.write("\n".join(new_hosts) + "\n")
+            print(f"Added {len(new_hosts)} host(s) to {target}")
+
+
+    files_to_check = [history_file]
+    if MARK_DONE:
+        files_to_check.append(donelist_file)
+    for f in files_to_check:
+        if not os.path.isfile(f):
+            open(f, "w").close()
+
+    donelist_set = read_lines_from_file(donelist_file) if MARK_DONE else set()
+    seen_missing_port = read_lines_from_file(missing_slist_file)
+
+    if PURGE_ONLY:
+        pv = purge_files(vault_dir)
+        mv = purge_files(mlist_dir)
+        pc = 0
+        for fn in os.listdir(cmdb_dir):
+            fp = os.path.join(cmdb_dir, fn)
+            if os.path.isfile(fp):
+                try:
+                    os.remove(fp)
+                    pc += 1
+                except Exception:
+                    pause_error(f"  \u26A0\uFE0F  Failed to delete: {fp}")
+        if MARK_DONE and not os.path.isfile(donelist_file):
+            print("  donelist.txt removed")
+        print("� Purge complete:")
+        print(f"  Deleted {pv} files from {vault_dir}")
+        print(f"  Deleted {mv} files from {mlist_dir}")
+        print(f"  Deleted {pc} files from {cmdb_dir}\n")
+        if os.path.isfile(history_file):
+            print("\u2705 cmdb-history.txt preserved.\n")
+            print("="*100)
+            print("� cmdb-history.txt contents:")
+            print("="*100)
+            print(open(history_file).read().strip())
+            print("="*100 + "\n")
+        else:
+            pause_error("\u26A0\uFE0F cmdb-history.txt not found!\n")
+        return 0
+
+    if not os.path.isfile(input_file):
+        print(f"ERROR: Missing input file: {input_file}")
+        return 1
+    if args.list or args.last:
+        deduplicate_file(input_file)
+    with open(input_file) as fh:
+        servers = [ln.strip() for ln in fh if ln.strip()]
+    servers = deduplicate_hosts(servers)
+    if not servers:
+        print("\u2139\ufe0f  No hosts found in openssh.txt—nothing to do.")
+        return 0
+
+    if RANDOMIZE_LIST:
+        random.shuffle(servers)
+
+
+
+    seen_completed = read_lines_from_file(complete_file)
+    seen_failures = read_lines_from_file(fail_file)
+    port_timeouts_total = len(seen_missing_port)
+    running_missing_total = 0
+    skipped_total = 0
+    success_total = 0
+    failure_total = 0
+    uptodate_total = 0
+    notuptodate_total = 0
+    patch_c_total = 0
+    patch_d_total = 0
+    room_zero_total = 0
+    global PATCH_GROUP_TOTALS
+    PATCH_GROUP_TOTALS = {"A": 0, "B": 0, "C": 0, "D": 0, "CUSTOM": 0}
+    idx = 1
+    auto_repeat_set: Set[str] = set()
+
+    if not FIX_INTERACTIVE:
+        print()
+        if os.path.isfile(history_file):
+            print(open(history_file).read().strip())
+        else:
+            pause_error("\u26A0\uFE0F cmdb-history.txt not found.")
+        print()
+
+    while idx <= len(servers):
+        server = servers[idx - 1].lower()
+        pause_triggered = False
+        pause_reason = ""
+        repeated = server in auto_repeat_set
+        if done_list_skip(server, idx, len(servers), donelist_set):
+            skipped_total += 1
+            pause_reason = "server on donelist"
+            alert_no_pause(pause_triggered, pause_reason)
+            print("\n" + "-"*100)
+            idx += 1
+            continue
+        # Check port 22 status to track failures but do not skip the host
+        port_22_ok = is_port_22_open(server)
+        if not port_22_ok and server not in seen_missing_port:
+            open(missing_slist_file, "a").write(f"{server}\n")
+            seen_missing_port.add(server)
+            port_timeouts_total = len(seen_missing_port)
+        if TEXT_SKIP:
+            if any(server.startswith(p) for p in SPECIAL_PREFIXES):
+                print(f"[{idx}/{len(servers)}] {server} \u2192 \u26a0\ufe0f  Disallowed prefix '{server.split('.')[0]}' detected.")
+                skipped_total += 1
+                pause_reason = "disallowed prefix"
+                alert_no_pause(pause_triggered, pause_reason)
+                remove_from_input_file(input_file, server)
+                print("\n" + "-"*100)
+                servers.pop(idx-1)
+                continue
+            if any(server.startswith(p) for p in SKIP_PREFIXES):
+                print(f"[{idx}/{len(servers)}] {server} \u2192 SKIPPED (matches exclusion list)")
+                skipped_total += 1
+                pause_reason = "excluded prefix"
+                alert_no_pause(pause_triggered, pause_reason)
+                print("\n" + "-"*100)
+                servers.pop(idx-1)
+                continue
+            if server.startswith("atl") and server.endswith(".pace.gatech.edu"):
+                print(f"[{idx}/{len(servers)}] {server} \u2192 SKIPPED (atl*.pace.gatech.edu)")
+                skipped_total += 1
+                pause_reason = "atl pace pattern"
+                alert_no_pause(pause_triggered, pause_reason)
+                print("\n" + "-"*100)
+                servers.pop(idx-1)
+                continue
+        out_path = os.path.join(vault_dir, f"{server}.txt")
+        if os.path.isfile(out_path) and not FORCE_OVERWRITE:
+            print(f"[{idx}/{len(servers)}] {server} \u2192 OUTPUT EXISTS, skipping")
+            skipped_total += 1
+            pause_reason = "output exists"
+            alert_no_pause(pause_triggered, pause_reason)
+            print("\n" + "-"*100)
+            idx += 1
+            continue
+        elif os.path.isfile(out_path):
+            print(f"[{idx}/{len(servers)}] {server} \u2192 OUTPUT EXISTS but overwrite enabled, updating")
+
+        pg_str = " ".join(
+            f"{k}:{PATCH_GROUP_TOTALS[k]}" for k in sorted(PATCH_GROUP_TOTALS)
+        )
+        line = (
+            f"[{idx}/{len(servers)}] {server} | Success: {uptodate_total} | "
+            f"Failures: {notuptodate_total} | Missing Log: {running_missing_total} | "
+            f"Port 22 Timeouts: {port_timeouts_total} | Room#0: {room_zero_total} | "
+            f"Patch Groups: {pg_str}"
+        )
+        if CDSPLIT:
+            line += f" | C Count: {patch_c_total} | D Count: {patch_d_total}"
+        print(line)
+
+
+        env = os.environ.copy()
+        env.update({
+            "CMDB_VMWARE": "1" if VMWARE_MODE else "0",
+            "CMDB_FORCE": "1" if FORCE_OVERWRITE else "0",
+            "CMDB_REMOTE": "1" if REMOTE_MODE else "0",
+            "CMDB_PASS": USER_PASSWORD,
+            "CMDB_VERBOSE": "1" if VERBOSE else "0",
+            "CMDB_APIFIX": "1" if APIFIX else "0",
+        })
+        print(f"---> about to run cmdb-presteps for {server}")
+        proc = subprocess.run([
+            os.path.join(os.path.dirname(__file__), "cmdb-presteps"),
+            server,
+        ], env=env)
+        if proc.returncode == 3:
+            print(f"  \u26a0\ufe0f  {server} has ARP age over 90 days; removing from list")
+            remove_from_input_file(input_file, server)
+            skipped_total += 1
+            print("\n" + "-" * 100)
+            servers.pop(idx-1)
+            continue
+        if proc.returncode != 0:
+            pause_error(f"  \u26A0\ufe0f  cmdb-presteps failed for {server}: code {proc.returncode}")
+            failure_total += 1
+            if server not in seen_failures:
+                open(fail_file, "a").write(f"{server}\n")
+                seen_failures.add(server)
+            if FORCE_PAUSE_MENU and is_port_22_open(server):
+                input("Press ENTER to continue… ")
+                pause_triggered = True
+            print("\n" + "-" * 100)
+            idx += 1
+            continue
+        if os.path.isfile(out_path):
+            lines = open(out_path).read().splitlines()
+        else:
+            lines = []
+        fields = parse_cmdb_fields(lines)
+        missing_fields = [
+            f
+            for f, v in fields.items()
+            if field_is_missing(f, v)
+        ]
+        opstat = (fields.get("operational_status") or "").strip().lower()
+        skip_missing_pause = opstat in ("retired", "inactive")
+        in_missing_file = False
+        try:
+            lines = [ln.strip().lower() for ln in open(MISSING_APIFIX_FILE)]
+            if server.lower() in lines:
+                in_missing_file = True
+        except Exception:
+            pass
+        if in_missing_file:
+            skip_missing_pause = True
+        if AUTO_RUN_SSETA and missing_fields and not repeated:
+            run_ssearch(server, 5)
+            if os.path.isfile(out_path):
+                try:
+                    os.remove(out_path)
+                except OSError:
+                    pass
+            auto_repeat_set.add(server)
+            continue
+        if FORCE_PAUSE_MENU and missing_fields and not skip_missing_pause:
+            print("  ─ Parsed CMDB Fields ─")
+            for fld in FIELD_ORDER:
+                val = fields[fld] or '<BLANK>'
+                if fld == 'ip_address' and val != '<BLANK>':
+                    val = extract_ipv4(val)
+                if fld == 'u_patch_group' and val != '<BLANK>' and '=' in val:
+                    prefix = val.split('=', 1)[0].strip()
+                    val = f"{val} ({prefix})"
+                if fld == 'u_room_number' and val == '<BLANK>':
+                    continue
+                print(f"    {fld:<20}\t{val}")
+                fields, repeat_req, changed = fix_menu(server, fields, out_path)
+            pause_triggered = True
+            if repeat_req:
+                continue
+            if MARK_DONE and not changed and server not in donelist_set:
+                open(donelist_file, "a").write(f"{server}\n")
+                donelist_set.add(server)
+                print(f"  \u2139\ufe0f  Added '{server}' to donelist.txt")
+            else:
+                if FULL_PAUSE and missing_fields and not skip_missing_pause:
+                    fields, repeat_req, changed = fix_menu(server, fields, out_path)
+                    pause_triggered = True
+                    if repeat_req:
+                        continue
+                    if MARK_DONE and not changed and server not in donelist_set:
+                        open(donelist_file, "a").write(f"{server}\n")
+                        donelist_set.add(server)
+                        print(f"  \u2139\ufe0f  Added '{server}' to donelist.txt")
+                elif FIX_INTERACTIVE and missing_fields and not skip_missing_pause:
+                    fields, repeat_req, changed = fix_menu(server, fields, out_path)
+                    pause_triggered = True
+                    if repeat_req:
+                        continue
+                    if MARK_DONE and not changed and server not in donelist_set:
+                        open(donelist_file, "a").write(f"{server}\n")
+                        donelist_set.add(server)
+                        print(f"  \u2139\ufe0f  Added '{server}' to donelist.txt")
+                elif PAUSE_ON_BLANK and missing_fields and not skip_missing_pause:
+                    msg = f"{server}: {len(missing_fields)} field(s) blank/None/n/a/undefined."
+                    input(msg + " Press ENTER to continue… ")
+
+        print("  ─ Parsed CMDB Fields ─")
+        for fld in FIELD_ORDER:
+            val = fields[fld] or '<BLANK>'
+            if fld == 'ip_address' and val != '<BLANK>':
+                val = extract_ipv4(val)
+            if fld == 'u_patch_group' and val != '<BLANK>' and '=' in val:
+                prefix = val.split('=', 1)[0].strip()
+                val = f"{val} ({prefix})"
+            if fld == 'u_room_number' and val == '<BLANK>':
+                continue
+            print(f"    {fld:<20}\t{val}")
+        final_missing = [
+            f
+            for f, v in fields.items()
+            if field_is_missing(f, v)
+        ]
+        if not final_missing:
+            uptodate_total += 1
+            print(f"  \u2705 All fields are up to date ({uptodate_total})")
+        else:
+            notuptodate_total += 1
+            total = len(FIELD_ORDER)
+            print(f"  Fields: {total-len(final_missing)}/{total} | Total Missing: {len(final_missing)}")
+            running_missing_total += len(final_missing)
+        if FORCE_PAUSE_MENU and not pause_triggered:
+            if skip_missing_pause and final_missing:
+                if in_missing_file:
+                    pause_reason = "listed in cmdb-missingrecords.txt"
+                else:
+                    pause_reason = f"operational_status {fields.get('operational_status', '')}"
+            elif not final_missing:
+                pause_reason = "no missing fields"
+            else:
+                pause_reason = "--auto active" if AUTO_RUN_SSETA else "other logic"
+            alert_no_pause(pause_triggered, pause_reason)
+
+        ping_ok_after = is_pingable(server)
+        print(f"  Ping After Presteps: {'pass' if ping_ok_after else 'fail'}")
+        if not ping_ok_after:
+            print(f"  \u26a0\ufe0f  {server} not pingable; removing from list")
+            skipped_total += 1
+            pause_reason = "unpingable host"
+            alert_no_pause(pause_triggered, pause_reason)
+            remove_from_input_file(input_file, server)
+            print("\n" + "-"*100)
+            time.sleep(1)
+            servers.pop(idx-1)
+            continue
+
+        if (fields.get("u_room_number") or "").strip() == "0":
+            room_zero_total += 1
+
+        pid_val = (fields.get(PATCH_ID_FIELD) or "").strip().upper()
+
+        if pid_val.startswith("CUSTOM"):
+            PATCH_GROUP_TOTALS["CUSTOM"] += 1
+        elif pid_val and pid_val[0] in PATCH_GROUP_TOTALS:
+            PATCH_GROUP_TOTALS[pid_val[0]] += 1
+        else:
+            pgrp = (fields.get("u_patch_group") or "").strip().upper()
+            if pgrp.startswith("CUSTOM"):
+                PATCH_GROUP_TOTALS["CUSTOM"] += 1
+            elif pgrp and pgrp[0] in PATCH_GROUP_TOTALS:
+                PATCH_GROUP_TOTALS[pgrp[0]] += 1
+
+        if CDSPLIT:
+            if pid_val == "C":
+                patch_c_total += 1
+            elif pid_val == "D":
+                patch_d_total += 1
+            if patch_c_total and patch_d_total:
+                if patch_c_total >= patch_d_total * 1.4 or patch_d_total >= patch_c_total * 1.4:
+                    input(f"--cdsplit pause: C={patch_c_total} D={patch_d_total}. Press ENTER to continue… ")
+
+        print("\n" + "-"*100)
+        auto_repeat_set.discard(server)
+        success_total += 1
+        idx += 1
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    summary = (
+        f"{ts} | Success: {success_total} | Failures: {failure_total} | "
+        f"Skipped: {skipped_total} | Missing Fields Logged: {running_missing_total} | "
+        f"Up-to-date: {uptodate_total} | Port 22 Timeouts: {port_timeouts_total} | "
+        f"Room#0: {room_zero_total} | "
+        f"Patch Groups: " + ", ".join(f"{k}:{PATCH_GROUP_TOTALS[k]}" for k in sorted(PATCH_GROUP_TOTALS)) + "\n"
+    )
+    open(history_file, "a").write(summary)
+
+    print("\n" + "="*100)
+    print("� cmdb-history.txt contents:")
+    print("="*100)
+    print(open(history_file).read().strip())
+    print("="*100 + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+##########################################
+#        END CMDBDOWNLOAD SCRIPT         #
+##########################################
