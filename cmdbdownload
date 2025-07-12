@@ -5,7 +5,7 @@ AUTHOR = "Matthew Boucher"
 CREATED = "2025-06-13"
 UPDATED = "2025-07-12"
 LINES = 2216
-CHARS = 87460
+CHARS = 87368
 
 ########################################################################
 # Script Name: cmdbdownload
@@ -2080,7 +2080,7 @@ def main() -> int:
                 if fld == 'u_room_number' and val == '<BLANK>':
                     continue
                 print(f"    {fld:<20}\t{val}")
-                fields, repeat_req, changed = fix_menu(server, fields, out_path)
+            fields, repeat_req, changed = fix_menu(server, fields, out_path)
             pause_triggered = True
             if repeat_req:
                 continue
@@ -2088,28 +2088,28 @@ def main() -> int:
                 open(donelist_file, "a").write(f"{server}\n")
                 donelist_set.add(server)
                 print(f"  \u2139\ufe0f  Added '{server}' to donelist.txt")
-            else:
-                if FULL_PAUSE and missing_fields and not skip_missing_pause:
-                    fields, repeat_req, changed = fix_menu(server, fields, out_path)
-                    pause_triggered = True
-                    if repeat_req:
-                        continue
-                    if MARK_DONE and not changed and server not in donelist_set:
-                        open(donelist_file, "a").write(f"{server}\n")
-                        donelist_set.add(server)
-                        print(f"  \u2139\ufe0f  Added '{server}' to donelist.txt")
-                elif FIX_INTERACTIVE and missing_fields and not skip_missing_pause:
-                    fields, repeat_req, changed = fix_menu(server, fields, out_path)
-                    pause_triggered = True
-                    if repeat_req:
-                        continue
-                    if MARK_DONE and not changed and server not in donelist_set:
-                        open(donelist_file, "a").write(f"{server}\n")
-                        donelist_set.add(server)
-                        print(f"  \u2139\ufe0f  Added '{server}' to donelist.txt")
-                elif PAUSE_ON_BLANK and missing_fields and not skip_missing_pause:
-                    msg = f"{server}: {len(missing_fields)} field(s) blank/None/n/a/undefined."
-                    input(msg + " Press ENTER to continue… ")
+        else:
+            if FULL_PAUSE and missing_fields and not skip_missing_pause:
+                fields, repeat_req, changed = fix_menu(server, fields, out_path)
+                pause_triggered = True
+                if repeat_req:
+                    continue
+                if MARK_DONE and not changed and server not in donelist_set:
+                    open(donelist_file, "a").write(f"{server}\n")
+                    donelist_set.add(server)
+                    print(f"  \u2139\ufe0f  Added '{server}' to donelist.txt")
+            elif FIX_INTERACTIVE and missing_fields and not skip_missing_pause:
+                fields, repeat_req, changed = fix_menu(server, fields, out_path)
+                pause_triggered = True
+                if repeat_req:
+                    continue
+                if MARK_DONE and not changed and server not in donelist_set:
+                    open(donelist_file, "a").write(f"{server}\n")
+                    donelist_set.add(server)
+                    print(f"  \u2139\ufe0f  Added '{server}' to donelist.txt")
+            elif PAUSE_ON_BLANK and missing_fields and not skip_missing_pause:
+                msg = f"{server}: {len(missing_fields)} field(s) blank/None/n/a/undefined."
+                input(msg + " Press ENTER to continue… ")
 
         print("  ─ Parsed CMDB Fields ─")
         for fld in FIELD_ORDER:
