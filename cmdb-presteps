@@ -2,12 +2,12 @@
 
 """Presteps for cmdbdownload."""
 
-VERSION = "5.19"
 AUTHOR = "Matthew Boucher"
 CREATED = "2025-06-13"
+VERSION = "5.19"
 UPDATED = "2025-07-12"
-LINES = 478
-CHARS = 18721
+LINES = 476
+CHARS = 18563
 
 ########################################################################
 # Script Name: cmdb-presteps
@@ -22,8 +22,6 @@ CHARS = 18721
 #   - /nethome/mboucher3/scriptdata/cmdbdownload/reports/cmdb-missingrecords.txt
 #   - /nethome/mboucher3/scriptdata/cmdbdownload/reports/cmdb-retiredlist.txt
 #   - /nethome/$USER/scriptdata/thevault/slistdata/<server>.txt
-#   - /nethome/mboucher3/scriptdata/thevault/resources/admin-managed_by_group.txt
-#   - /nethome/mboucher3/scriptdata/thevault/resources/admin-u_grouping.txt
 ########################################################################
 
 
