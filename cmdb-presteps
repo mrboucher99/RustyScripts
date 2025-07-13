@@ -6,8 +6,8 @@ AUTHOR = "Matthew Boucher"
 CREATED = "2025-06-13"
 VERSION = "5.19"
 UPDATED = "2025-07-12"
-LINES = 476
-CHARS = 18563
+LINES = 475
+CHARS = 18448
 
 ########################################################################
 # Script Name: cmdb-presteps
@@ -353,20 +353,19 @@ def main():
     retired_set = False
     arp_old = arp_ok and arp_days > 90
     if arp_old:
-        resp = input(
-            f"  \u26a0\ufe0f  ARP entry is {arp_days} days old (>90). Press ENTER to set operational_status and classification to 'Retired' or 'x' to skip: "
-        ).strip().lower()
-        if resp != "x":
-            changed = False
-            if cmdb.update_field(server, fields, "operational_status", "Retired", out_path):
-                print("  operational_status set to 'Retired'")
-                changed = True
-            if cmdb.update_field(server, fields, "classification", "Retired", out_path):
-                print("  classification set to 'Retired'")
-                changed = True
-            if changed:
-                retired_set = True
-                record_retired(server)
+        print(
+            f"  \u26a0\ufe0f  ARP entry is {arp_days} days old (>90). Setting operational_status and classification to 'Retired'"
+        )
+        changed = False
+        if cmdb.update_field(server, fields, "operational_status", "Retired", out_path):
+            print("  operational_status set to 'Retired'")
+            changed = True
+        if cmdb.update_field(server, fields, "classification", "Retired", out_path):
+            print("  classification set to 'Retired'")
+            changed = True
+        if changed:
+            retired_set = True
+            record_retired(server)
 
     if "uat" in server.lower() and cmdb.field_is_missing("environment", fields.get("environment")):
         if cmdb.update_field(server, fields, "environment", "Test", out_path):
