@@ -735,7 +735,7 @@ def fix_menu(host: str, fields: Dict[str, Optional[str]], out_path: str) -> Tupl
                 print()
                 time.sleep(2)
             break
-        print("\n�  Missing fields:")
+        print(f"\n�  Missing fields for {host}:")
         for i, fld in enumerate(missing, 1):
             notes = []
             if fld in SUBMENU_FIELDS:
