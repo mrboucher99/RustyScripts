@@ -4,10 +4,10 @@
 
 AUTHOR = "Matthew Boucher"
 CREATED = "2025-06-13"
-VERSION = "5.19"
-UPDATED = "2025-07-12"
-LINES = 475
-CHARS = 18448
+VERSION = "5.20"
+UPDATED = "2025-07-13"
+LINES = 483
+CHARS = 18822
 
 ########################################################################
 # Script Name: cmdb-presteps
@@ -140,9 +140,13 @@ def run_apifix_tasks(
     classification_retired: bool,
     patch_id_x: bool,
     monitor_false: bool,
+    classification_production: bool,
     arp_info: Optional[Dict[str, str]] = None,
 ) -> None:
-    """Run monitoring checks when --apifix is active."""
+    """Run monitoring checks when --apifix is active.
+
+    zbxapi only runs if the classification from slist is Production.
+    """
     if not enabled:
         return
     print("\n--- APIFIX TASKS ---")
@@ -187,8 +191,10 @@ def run_apifix_tasks(
                 with open(report_file, "a") as fh:
                     fh.write(server + "\n")
                 print(f"  Added '{server}' to {os.path.basename(report_file)}")
-        if not monitor_false:
+        if not monitor_false and classification_production:
             run_and_log([ZBXAPI_CMD, server], "zbxapi", success_pattern=r"is\s+monitored")
+        elif not classification_production:
+            print("  zbxapi skipped: classification not Production")
         else:
             print("  zbxapi skipped: monitor field is false")
         run_and_log([
@@ -338,6 +344,7 @@ def main():
     fields = cmdb.parse_cmdb_fields(lines)
     classification_orig = (fields.get("classification") or "")
     classification_retired = "retired" in classification_orig.lower()
+    classification_production = classification_orig.strip().lower() == "production"
     if classification_retired:
         record_retired(server)
     patch_id_val = (fields.get(cmdb.PATCH_ID_FIELD) or "").strip().upper()
@@ -459,6 +466,7 @@ def main():
         classification_retired,
         patch_id_x,
         monitor_false,
+        classification_production,
         arp_info,
     )
 
