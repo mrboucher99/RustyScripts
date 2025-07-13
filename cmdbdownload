@@ -3,7 +3,7 @@
 VERSION = "5.20"
 AUTHOR = "Matthew Boucher"
 CREATED = "2025-06-13"
-UPDATED = "2025-07-13"
+UPDATED = "2025-07-12"
 LINES = 2217
 CHARS = 87419
 
@@ -464,8 +464,8 @@ def parse_args() -> argparse.Namespace:
         "--apifix",
         action="store_true",
         help=(
-            "run zbxapi and eipapi presteps to record monitoring status "
-            "(password is passed to both; zbxapi is skipped when monitor is false "
+            "run zbiapi and eipapi presteps to record monitoring status "
+            "(password is passed to both; zbiapi is skipped when monitor is false "
             "or classification is not Production; skipped entirely when classification "
             "is Retired or patch identifier is X)"
         ),
