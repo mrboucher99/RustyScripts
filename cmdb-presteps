@@ -5,9 +5,9 @@
 AUTHOR = "Matthew Boucher"
 CREATED = "2025-06-13"
 VERSION = "5.20"
-UPDATED = "2025-07-12"
-LINES = 484
-CHARS = 18860
+UPDATED = "2025-07-13"
+LINES = 487
+CHARS = 19021
 
 ########################################################################
 # Script Name: cmdb-presteps
@@ -159,13 +159,16 @@ def run_apifix_tasks(
         def run_and_log(cmd, label, success_pattern=None, display_user=None):
             user = display_user or cmdb_module.CURRENT_USER or getpass.getuser()
             cmd_str = " ".join(cmd)
+            masked_pwd = "*" * len(cmdb_module.USER_PASSWORD)
+            pipe_cmd = f"echo {masked_pwd} | {cmd_str}"
             print(f"  Running {cmd_str} as {user}")
+            print(f"  Syntax: {pipe_cmd}")
             try:
-                pipe_cmd = (
+                real_cmd = (
                     f"echo {shlex.quote(cmdb_module.USER_PASSWORD)} | {cmd_str}"
                 )
                 proc = subprocess.run(
-                    pipe_cmd,
+                    real_cmd,
                     shell=True,
                     text=True,
                     capture_output=True,
