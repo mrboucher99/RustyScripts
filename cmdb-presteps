@@ -6,8 +6,8 @@ AUTHOR = "Matthew Boucher"
 CREATED = "2025-06-13"
 VERSION = "5.20"
 UPDATED = "2025-07-13"
-LINES = 487
-CHARS = 19021
+LINES = 485
+CHARS = 18974
 
 ########################################################################
 # Script Name: cmdb-presteps
@@ -205,8 +205,6 @@ def run_apifix_tasks(
             EIPAPI_CMD,
             "--checkname",
             server,
-            "--user",
-            EIPAPI_USER,
         ], "eipapi", success_pattern=server, display_user=EIPAPI_USER)
     else:
         reasons = []
