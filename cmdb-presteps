@@ -44,8 +44,8 @@ REPORTS_DIR = "/nethome/mboucher3/scriptdata/cmdbdownload/reports"
 MONITORED_FILE = os.path.join(REPORTS_DIR, "cmdb-monitored.txt")
 NOT_MONITORED_FILE = os.path.join(REPORTS_DIR, "cmdb-not-monitored.txt")
 MISSING_FILE = os.path.join(REPORTS_DIR, "cmdb-missingrecords.txt")
-# Path for the zbiapi monitoring tool
-ZBIAPI_CMD = "/nethome/mboucher3/zbiapi"
+# Path for the zbxapi monitoring tool
+ZBXAPI_CMD = "/nethome/mboucher3/zbxapi"
 RETIRED_FILE = os.path.join(REPORTS_DIR, "cmdb-retiredlist.txt")
 # Path for the eipapi monitoring tool (corrected from the earlier 'eipapt' typo)
 EIPAPI_CMD = "/nethome/mboucher3/eipapi"
@@ -146,7 +146,7 @@ def run_apifix_tasks(
 ) -> None:
     """Run monitoring checks when --apifix is active.
 
-    zbiapi only runs if the classification from slist is Production.
+    zbxapi only runs if the classification from slist is Production.
     """
     if not enabled:
         return
@@ -181,7 +181,7 @@ def run_apifix_tasks(
                 success = False
             if label == "eipapi":
                 print(f"  eipapi check: {'pass' if success else 'fail'}")
-            monitored = bool(re.search(r"is\s+monitored", out_text, re.IGNORECASE)) if label == "zbiapi" else success
+            monitored = bool(re.search(r"is\s+monitored", out_text, re.IGNORECASE)) if label == "zbxapi" else success
             report_file = MONITORED_FILE if monitored else NOT_MONITORED_FILE
             try:
                 lines = [ln.strip() for ln in open(report_file)]
@@ -193,11 +193,11 @@ def run_apifix_tasks(
                     fh.write(server + "\n")
                 print(f"  Added '{server}' to {os.path.basename(report_file)}")
         if not monitor_false and classification_production:
-            run_and_log([ZBIAPI_CMD, server], "zbiapi", success_pattern=r"is\s+monitored")
+            run_and_log([ZBXAPI_CMD, server], "zbxapi", success_pattern=r"is\s+monitored")
         elif not classification_production:
-            print("  zbiapi skipped: classification not Production")
+            print("  zbxapi skipped: classification not Production")
         else:
-            print("  zbiapi skipped: monitor field is false")
+            print("  zbxapi skipped: monitor field is false")
         run_and_log([
             EIPAPI_CMD,
             "--checkname",
