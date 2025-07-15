@@ -6,8 +6,8 @@ AUTHOR = "Matthew Boucher"
 CREATED = "2025-06-13"
 VERSION = "5.20"
 UPDATED = "2025-07-13"
-LINES = 482
-CHARS = 18869
+LINES = 485
+CHARS = 19016
 
 ########################################################################
 # Script Name: cmdb-presteps
@@ -163,10 +163,13 @@ def run_apifix_tasks(
             pipe_cmd = f"echo {masked_pwd} | {cmd_str}"
             print(f"  Running {cmd_str} as {user}")
             print(f"  Syntax: {pipe_cmd}")
+            input_data = cmdb_module.USER_PASSWORD + "\n"
+            if label == "eipapi":
+                input_data = f"{EIPAPI_USER}\n{cmdb_module.USER_PASSWORD}\n"
             try:
                 proc = subprocess.run(
                     cmd,
-                    input=cmdb_module.USER_PASSWORD + "\n",
+                    input=input_data,
                     text=True,
                     capture_output=True,
                     timeout=10,
