@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+####################################
+# automail - Version 1.35          #
+####################################
+# Change Log (last 10 entries)
+# 1.35 - Split monolithic script into core and gui modules.
+# 1.34 - Display manager email from managed_by-emailaddress.txt.
+# 1.33 - Provide menu for --cc with operations@oit.gatech.edu or manual entry.
+# 1.32 - Add --cc argument and parse Cc from templates.
+# 1.31 - Map managed_by values to email addresses via managed_by-emailaddress.txt.
+# 1.30 - Ensure default signature exists and display its contents.
+# 1.29 - Show managed_by info via slist for each server.
+# 1.28 - Remove timestamp from server progress line.
+# 1.27 - Add --template menu to manage email templates.
+# 1.26 - GUI menu offers all CLI options.
+#
+# Reads from:
+#   /nethome/mboucher3/scriptdata/automail/lists/<file>      (server lists)
+#   /nethome/mboucher3/scriptdata/automail/templates/<file>  (email templates)
+#   /nethome/mboucher3/scriptdata/automail/signatures/<file> (email signatures)
+#   templist.txt                                             (temporary server list)
+#   managed_by-emailaddress.txt                              (manager email map)
+# Writes to:
+#   /nethome/mboucher3/scriptdata/automail/templates/<file>  (email templates)
+#   /nethome/mboucher3/scriptdata/automail/signatures/<file> (email signatures)
+#   templist.txt                                             (temporary server list)
+#   managed_by-emailaddress.txt                              (manager email map)
+#
+# Arguments:
+#   names                 Server names
+#   --gui                 Run in interactive CLI mode
+#   --list                Edit server list in vi
+#   --last                Reuse server list from last --list run
+#   --load                Select or create a list file in the lists directory
+#   --template            Manage template files in the templates directory
+#   --cc                  Choose CC email address
+#
+# Simple script to process server lists and display management
+# information. The script can be run from the command line, for example:
+#
+#     ./automail server1 server2
+#
+# Use ``--gui`` to enter names interactively instead of supplying them on
+# the command line.
+
+from __future__ import annotations
+
+import argparse
+import subprocess
+from pathlib import Path
+
+import core
+from gui import run_gui
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=f"{core.VERSION_TAG} - Show managed_by info for servers via slist",
+    )
+    parser.add_argument("names", nargs="*", help="Server names")
+    parser.add_argument("--gui", action="store_true", help="Run in interactive CLI mode")
+    parser.add_argument("--list", action="store_true", help="Edit server list in vi")
+    parser.add_argument("--last", action="store_true", help="Reuse server list from last --list run")
+    parser.add_argument("--load", action="store_true", help="Select or create a list file in the lists directory")
+    parser.add_argument("--template", action="store_true", help="Manage template files in the templates directory")
+    parser.add_argument("--cc", action="store_true", help="Choose CC email address")
+
+    args = parser.parse_args()
+
+    if args.gui:
+        run_gui(args)
+        return
+
+    if args.template:
+        core.display_banner()
+        core.select_template_file()
+        return
+
+    if args.list and args.last:
+        parser.error("--list and --last cannot be used together")
+    if args.load and (args.list or args.last):
+        parser.error("--load cannot be used with --list or --last")
+    if args.names and (args.list or args.last or args.load):
+        parser.error("names cannot be combined with list-based options")
+
+    core.display_banner()
+    core.ensure_default_signature()
+    template = core.load_template(core.DEFAULT_TEMPLATE_PATH)
+    cc_address = template.get("cc")
+    if args.cc:
+        cc_address = core.choose_cc_address()
+    if cc_address:
+        print(f"Using CC: {cc_address}")
+
+    list_path: Path | None = None
+    if args.list:
+        list_path = core.TEMPLIST_PATH
+        if list_path.exists():
+            list_path.unlink()
+        subprocess.run(["vi", str(list_path)])
+        if not list_path.exists():
+            list_path.touch()
+        names = [line.strip() for line in list_path.read_text().splitlines() if line.strip()]
+    elif args.last:
+        list_path = core.TEMPLIST_PATH
+        if not list_path.exists():
+            subprocess.run(["vi", str(list_path)])
+            if not list_path.exists():
+                list_path.touch()
+        names = [line.strip() for line in list_path.read_text().splitlines() if line.strip()]
+    elif args.load:
+        list_path = core.select_list_file()
+        if list_path is None:
+            return
+        with list_path.open() as f:
+            names = [line.strip() for line in f if line.strip()]
+    else:
+        if not args.names:
+            parser.error("names are required unless --list, --last, or --load is used")
+        names = args.names
+
+    if list_path is not None:
+        line_count = core.count_lines(list_path)
+        print(f"Processing file: {list_path.name} ({line_count} lines)")
+
+    core.show_managed_by(names)
+
+
+if __name__ == "__main__":
+    main()
+####################################
+# End of automail - Version 1.35   #
+####################################
