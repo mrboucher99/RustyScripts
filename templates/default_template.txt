@@ -1,0 +1,7 @@
+Sender: sender@example.com
+Cc: cc@example.com
+Subject: Greetings {name}
+
+Dear {name},
+
+This is an automated message sent using the default template.
