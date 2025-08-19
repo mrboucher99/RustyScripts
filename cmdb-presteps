@@ -1,0 +1,485 @@
+#!/usr/bin/env python3
+
+"""Presteps for cmdbdownload."""
+
+AUTHOR = "Matthew Boucher"
+CREATED = "2025-06-13"
+VERSION = "5.20"
+UPDATED = "2025-07-13"
+LINES = 485
+CHARS = 19016
+
+########################################################################
+# Script Name: cmdb-presteps
+#
+# Reads:
+#   - /nethome/mboucher3/scriptdata/thevault/resources/admin-managerlist.txt
+#   - /nethome/mboucher3/scriptdata/thevault/resources/admin-managed_by_group.txt
+#   - /nethome/mboucher3/scriptdata/thevault/resources/admin-u_grouping.txt
+# Writes:
+#   - /nethome/mboucher3/scriptdata/cmdbdownload/reports/cmdb-monitored.txt
+#   - /nethome/mboucher3/scriptdata/cmdbdownload/reports/cmdb-not-monitored.txt
+#   - /nethome/mboucher3/scriptdata/cmdbdownload/reports/cmdb-missingrecords.txt
+#   - /nethome/mboucher3/scriptdata/cmdbdownload/reports/cmdb-retiredlist.txt
+#   - /nethome/$USER/scriptdata/thevault/slistdata/<server>.txt
+########################################################################
+
+
+import os
+import sys
+import subprocess
+import socket
+import ipaddress
+import getpass
+import importlib.util
+import importlib.machinery
+import json
+import re
+import shlex
+from datetime import datetime
+from typing import Optional, Dict
+
+# Paths for monitoring reports
+REPORTS_DIR = "/nethome/mboucher3/scriptdata/cmdbdownload/reports"
+MONITORED_FILE = os.path.join(REPORTS_DIR, "cmdb-monitored.txt")
+NOT_MONITORED_FILE = os.path.join(REPORTS_DIR, "cmdb-not-monitored.txt")
+MISSING_FILE = os.path.join(REPORTS_DIR, "cmdb-missingrecords.txt")
+# Path for the zbxapi monitoring tool
+ZBXAPI_CMD = "/nethome/mboucher3/zbxapi"
+RETIRED_FILE = os.path.join(REPORTS_DIR, "cmdb-retiredlist.txt")
+# Path for the eipapi monitoring tool (corrected from the earlier 'eipapt' typo)
+EIPAPI_CMD = "/nethome/mboucher3/eipapi"
+EIPAPI_USER = "oit-mboucher3"
+
+
+def load_cmdbdownload():
+    path = os.path.join(os.path.dirname(__file__), "cmdbdownload")
+    loader = importlib.machinery.SourceFileLoader("cmdbdownload", path)
+    spec = importlib.util.spec_from_loader("cmdbdownload", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def format_mac(raw: str) -> str:
+    """Return MAC address in colon-separated format if possible."""
+    if raw is None:
+        raw_str = ""
+    else:
+        raw_str = raw.decode() if isinstance(raw, bytes) else str(raw)
+    mac = re.sub(r"[^0-9A-Fa-f]", "", raw_str)
+    if len(mac) == 12:
+        return ":".join(mac[i:i+2] for i in range(0, 12, 2)).lower()
+    return raw_str.strip()
+
+
+def check_arp_if_needed(host: str, ip: str):
+    """Lookup ARP info via BOK API for the given IP."""
+    if not ip:
+        return False, -1, {}
+    try:
+        res = subprocess.run(
+            [
+                "curl",
+                "--silent",
+                f"https://bok.noc.gatech.edu/api/arp_lookup.php?search_by=IP&search_term={ip}",
+            ],
+            stdout=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        print("  ARP Lookup: timeout")
+        return False, -1, {}
+    except Exception as e:
+        print(f"  ARP Lookup: error ({e})")
+        return False, -1, {}
+
+    try:
+        data = json.loads(res.stdout)
+    except json.JSONDecodeError as jde:
+        print(f"  ARP Lookup: invalid JSON ({jde})")
+        return False, -1, {}
+
+    if data.get("status") != "Success":
+        print("  ARP Lookup: API returned error")
+        return False, -1, {}
+
+    verified_ts = data.get("verified")
+    try:
+        age = (
+            datetime.now() - datetime.strptime(verified_ts, "%Y-%m-%d %H:%M:%S")
+        ).days if verified_ts else -1
+    except Exception:
+        age = -1
+
+    mac = format_mac(data.get("result", ""))
+    print(
+        f"  ARP Lookup: pass | MAC={mac} | Verified={verified_ts} | Age={age} days"
+    )
+    return True, age, {"mac": mac, "verified": verified_ts}
+
+
+def record_retired(server: str) -> None:
+    """Append server to the retired list if not already recorded."""
+    try:
+        lines = [ln.strip() for ln in open(RETIRED_FILE)]
+    except Exception:
+        lines = []
+    lower_set = {ln.lower() for ln in lines}
+    if server.lower() not in lower_set:
+        with open(RETIRED_FILE, "a") as fh:
+            fh.write(server + "\n")
+        print(f"  Added '{server}' to {os.path.basename(RETIRED_FILE)}")
+
+
+def run_apifix_tasks(
+    cmdb_module,
+    server: str,
+    enabled: bool,
+    ping_ok: bool,
+    classification_retired: bool,
+    patch_id_x: bool,
+    monitor_false: bool,
+    classification_production: bool,
+    arp_info: Optional[Dict[str, str]] = None,
+) -> None:
+    """Run monitoring checks when --apifix is active.
+
+    zbxapi only runs if the classification from slist is Production.
+    """
+    if not enabled:
+        return
+    print("\n--- APIFIX TASKS ---")
+    if arp_info:
+        mac = arp_info.get("mac", "")
+        verified = arp_info.get("verified", "")
+        print(f"  ARP Info: MAC={mac} Verified={verified}")
+    if ping_ok and not classification_retired and not patch_id_x:
+        def run_and_log(cmd, label, success_pattern=None, display_user=None):
+            user = display_user or cmdb_module.CURRENT_USER or getpass.getuser()
+            cmd_str = " ".join(cmd)
+            masked_pwd = "*" * len(cmdb_module.USER_PASSWORD)
+            pipe_cmd = f"echo {masked_pwd} | {cmd_str}"
+            print(f"  Running {cmd_str} as {user}")
+            print(f"  Syntax: {pipe_cmd}")
+            input_data = cmdb_module.USER_PASSWORD + "\n"
+            if label == "eipapi":
+                input_data = f"{EIPAPI_USER}\n{cmdb_module.USER_PASSWORD}\n"
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    input=input_data,
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                )
+                out_text = proc.stdout
+                success = bool(
+                    re.search(success_pattern, out_text, re.IGNORECASE)
+                ) if success_pattern else proc.returncode == 0
+            except Exception as e:
+                print(f"  {label} error: {e}")
+                out_text = ""
+                success = False
+            if label == "eipapi":
+                print(f"  eipapi check: {'pass' if success else 'fail'}")
+            monitored = bool(re.search(r"is\s+monitored", out_text, re.IGNORECASE)) if label == "zbxapi" else success
+            report_file = MONITORED_FILE if monitored else NOT_MONITORED_FILE
+            try:
+                lines = [ln.strip() for ln in open(report_file)]
+            except Exception:
+                lines = []
+            lower_set = {ln.lower() for ln in lines}
+            if server.lower() not in lower_set:
+                with open(report_file, "a") as fh:
+                    fh.write(server + "\n")
+                print(f"  Added '{server}' to {os.path.basename(report_file)}")
+        if not monitor_false and classification_production:
+            run_and_log([ZBXAPI_CMD, server], "zbxapi", success_pattern=r"is\s+monitored")
+        elif not classification_production:
+            print("  zbxapi skipped: classification not Production")
+        else:
+            print("  zbxapi skipped: monitor field is false")
+        run_and_log([
+            EIPAPI_CMD,
+            "--checkname",
+            server,
+        ], "eipapi", success_pattern=server, display_user=EIPAPI_USER)
+    else:
+        reasons = []
+        if classification_retired:
+            reasons.append("classification is Retired")
+        if not ping_ok:
+            reasons.append("host not pingable")
+        if patch_id_x:
+            reasons.append(f"{cmdb_module.PATCH_ID_FIELD} is X")
+        reason = " and ".join(reasons) if reasons else "preconditions not met"
+        print(f"  apifix skipped: {reason}")
+        try:
+            lines = [ln.strip() for ln in open(MISSING_FILE)]
+        except Exception:
+            lines = []
+        lower_set = {ln.lower() for ln in lines}
+        if server.lower() not in lower_set:
+            with open(MISSING_FILE, "a") as fh:
+                fh.write(server + "\n")
+            print(f"  Added '{server}' to {os.path.basename(MISSING_FILE)}")
+
+
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: cmdb-presteps <server>", file=sys.stderr)
+        return 1
+    server = sys.argv[1]
+    print(f"Running cmdb-presteps for {server}")
+    cmdb = load_cmdbdownload()
+
+    # Apply flag values from environment
+    cmdb.VMWARE_MODE = os.getenv("CMDB_VMWARE", "0") == "1"
+    cmdb.FORCE_OVERWRITE = os.getenv("CMDB_FORCE", "0") == "1"
+    cmdb.REMOTE_MODE = os.getenv("CMDB_REMOTE", "0") == "1"
+    cmdb.USER_PASSWORD = os.getenv("CMDB_PASS", "")
+    cmdb.VERBOSE = os.getenv("CMDB_VERBOSE", "0") == "1"
+    apifix = os.getenv("CMDB_APIFIX", "0") == "1"
+
+    cmdb.ADMIN_MANAGER_MAP = cmdb.load_admin_manager_map(cmdb.ADMIN_MANAGER_FILE)
+    cmdb.ADMIN_MANAGED_GROUP_MAP = cmdb.load_admin_managed_group_map(cmdb.ADMIN_MANAGED_GROUP_FILE)
+    cmdb.ADMIN_U_GROUPING_MAP = cmdb.load_admin_u_grouping_map(cmdb.ADMIN_U_GROUPING_FILE)
+
+    current_user = getpass.getuser()
+    cmdb.CURRENT_USER = current_user
+    base_dir = os.path.join("/nethome", current_user, "scriptdata")
+    vault_dir = os.path.join(base_dir, "thevault", "slistdata")
+    mlist_dir = os.path.join(base_dir, "thevault", "mlistdata")
+    os.makedirs(vault_dir, exist_ok=True)
+    os.makedirs(mlist_dir, exist_ok=True)
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+
+    out_path = os.path.join(vault_dir, f"{server}.txt")
+    TIMEOUT = int(os.getenv("CMDB_TIMEOUT", "3"))
+    MIN_LINES = 10
+
+    try:
+        ip_addr = socket.gethostbyname(server)
+        dns_ok = True
+    except Exception:
+        print(f"  \u26a0\ufe0f  Cannot resolve {server}")
+        dns_ok = False
+        ip_addr = ""
+
+    if not dns_ok:
+        print(f"  Attempting slist lookup for {server}")
+        try:
+            proc = subprocess.run([
+                "slist",
+                server,
+            ], capture_output=True, text=True, timeout=TIMEOUT)
+            slist_lines = proc.stdout.strip().splitlines()
+        except subprocess.SubprocessError as se:
+            print(f"  slist lookup failed: {se}")
+            return 1
+        if len(slist_lines) >= MIN_LINES:
+            with open(out_path, "w") as fh:
+                fh.write("\n".join(slist_lines))
+            fields = cmdb.parse_cmdb_fields(slist_lines)
+            changed = False
+            if cmdb.update_field(server, fields, "operational_status", "Retired", out_path):
+                print("  operational_status set to 'Retired'")
+                changed = True
+            if cmdb.update_field(server, fields, "classification", "Retired", out_path):
+                print("  classification set to 'Retired'")
+                changed = True
+            if changed:
+                record_retired(server)
+                return 3
+        return 1
+
+    ping_ok = cmdb.is_pingable(server)
+    print(f"  Ping Check (IP {ip_addr}): {'pass' if ping_ok else 'fail'}")
+    # Perform ARP lookup whenever an IP is available
+    arp_ok, arp_days, arp_info = check_arp_if_needed(server, ip_addr)
+    port_22_ok = cmdb.is_port_22_open(server)
+    print(f"  Port 22 Check: {'pass' if port_22_ok else 'fail'}")
+    if not port_22_ok:
+        port_3389_ok = cmdb.is_port_3389_open(server)
+        print(f"  Port 3389 Check: {'pass' if port_3389_ok else 'fail'}")
+
+    ip_obj = ipaddress.IPv4Address(ip_addr)
+    network_hit = (
+        "BIGIQ" if any(ip_obj in net for net in cmdb.BIGIQ_NETWORKS)
+        else "myF5LABS" if any(ip_obj in net for net in cmdb.MYF5LABS_NETWORKS)
+        else None
+    )
+    if network_hit:
+        print(f"  BIGIQ Check: fail ({network_hit})")
+        return 2
+    else:
+        print("  BIGIQ Check: pass (not in BIGIQ or myF5LABS)")
+
+    search_text = cmdb.server_prefix(server)
+    total_files = sum(1 for n in os.listdir(vault_dir) if search_text in n)
+    print(f"  slistdata check: {total_files} [ {search_text} ]")
+
+    m_total = sum(1 for n in os.listdir(mlist_dir) if search_text in n)
+    print(f"  mlistdata check: {m_total} [ {search_text} ]")
+
+    cmdb.pre_slist_owner_fix(server, out_path)
+
+    print(f"  Running command: slist {server}")
+    try:
+        proc = subprocess.run(["slist", server], capture_output=True, text=True, check=True, timeout=TIMEOUT)
+        lines = proc.stdout.strip().splitlines()
+    except subprocess.TimeoutExpired:
+        print(f"  \u23f1  slist timed out after {TIMEOUT}s")
+        return 1
+    except subprocess.CalledProcessError as err:
+        out_lines = err.stdout.strip().splitlines() if err.stdout else []
+        if len(out_lines) < MIN_LINES:
+            print(f"  \u274c slist failed ({err.returncode}) with too few lines")
+            return 1
+        lines = out_lines
+
+    with open(out_path, "w") as fh:
+        fh.write("\n".join(lines))
+
+    fields = cmdb.parse_cmdb_fields(lines)
+    classification_orig = (fields.get("classification") or "")
+    classification_retired = "retired" in classification_orig.lower()
+    classification_production = classification_orig.strip().lower() == "production"
+    if classification_retired:
+        record_retired(server)
+    patch_id_val = (fields.get(cmdb.PATCH_ID_FIELD) or "").strip().upper()
+    patch_id_x = patch_id_val == "X"
+    monitor_val = (fields.get("monitor") or "").strip().lower()
+    monitor_false = monitor_val == "false"
+
+    # Ensure u_room_number is set to 0 when port 22 is reachable
+    if port_22_ok:
+        if cmdb.update_field(server, fields, "u_room_number", "0", out_path):
+            print("  u_room_number set to '0'")
+
+    retired_set = False
+    arp_old = arp_ok and arp_days > 90
+    if arp_old:
+        print(
+            f"  \u26a0\ufe0f  ARP entry is {arp_days} days old (>90). Setting operational_status and classification to 'Retired'"
+        )
+        changed = False
+        if cmdb.update_field(server, fields, "operational_status", "Retired", out_path):
+            print("  operational_status set to 'Retired'")
+            changed = True
+        if cmdb.update_field(server, fields, "classification", "Retired", out_path):
+            print("  classification set to 'Retired'")
+            changed = True
+        if changed:
+            retired_set = True
+            record_retired(server)
+
+    if "uat" in server.lower() and cmdb.field_is_missing("environment", fields.get("environment")):
+        if cmdb.update_field(server, fields, "environment", "Test", out_path):
+            print("  environment set to 'Test'")
+
+    if server.endswith(".sw.gatech.edu"):
+        if cmdb.field_is_missing("manufacturer", fields.get("manufacturer")):
+            if cmdb.update_field(server, fields, "manufacturer", "Network Device", out_path):
+                print("  manufacturer set to 'Network Device'")
+        if cmdb.field_is_missing("os", fields.get("os")):
+            if cmdb.update_field(server, fields, "os", "Network Device", out_path):
+                print("  os set to 'Network Device'")
+
+    # Enforce patch group D for hosts containing 'bpxe'
+    if "bpxe" in server.lower():
+        pg_val = "D = 4th Thursday after Patch Tuesday"
+        if fields.get("u_patch_group") != pg_val:
+            if cmdb.update_field(server, fields, "u_patch_group", pg_val, out_path):
+                print("  u_patch_group set to 'D = 4th Thursday after Patch Tuesday'")
+        if fields.get(cmdb.PATCH_ID_FIELD) != "D":
+            if cmdb.update_field(server, fields, cmdb.PATCH_ID_FIELD, "D", out_path):
+                print(f"  {cmdb.PATCH_ID_FIELD} set to 'D'")
+
+    status = (fields.get("operational_status") or "").strip()
+    if not retired_set:
+        if ping_ok:
+            if status.lower() != "retired":
+                if cmdb.update_field(server, fields, "operational_status", "Operational", out_path):
+                    print("  operational_status set to 'Operational'")
+        else:
+            if status.lower() != "retired":
+                if cmdb.update_field(server, fields, "operational_status", "Inactive", out_path):
+                    print("  operational_status set to 'Inactive'")
+
+    fields, updates = cmdb.pre_display_checks(server, fields, out_path, port_22_ok)
+    if updates:
+        print(f"  Pre-checks updated: {', '.join(updates)}")
+
+    managed_val = (fields.get("managed_by") or "").strip()
+    grouping_val = (fields.get("u_grouping") or "").strip()
+    if managed_val and grouping_val:
+        pair_line = f"{managed_val},{grouping_val}"
+        try:
+            lines = [ln.strip() for ln in open(cmdb.ADMIN_U_GROUPING_FILE)]
+        except Exception:
+            lines = []
+        if not any(pair_line.lower() == ln.lower() for ln in lines):
+            try:
+                with open(cmdb.ADMIN_U_GROUPING_FILE, "a") as fh:
+                    fh.write(pair_line + "\n")
+                cmdb.ADMIN_U_GROUPING_MAP[managed_val] = grouping_val
+                print(f"  Added '{pair_line}' to admin-u_grouping.txt")
+            except Exception as e:
+                print(f"  \u26A0\ufe0f  Failed to update admin-u_grouping file: {e}")
+
+    managed_group_val = (fields.get("managed_by_group") or "").strip()
+    if managed_val and managed_group_val:
+        pair_line = f"{managed_val},{managed_group_val}"
+        try:
+            lines = [ln.strip() for ln in open(cmdb.ADMIN_MANAGED_GROUP_FILE)]
+        except Exception:
+            lines = []
+        if not any(pair_line.lower() == ln.lower() for ln in lines):
+            try:
+                with open(cmdb.ADMIN_MANAGED_GROUP_FILE, "a") as fh:
+                    fh.write(pair_line + "\n")
+                cmdb.ADMIN_MANAGED_GROUP_MAP[managed_val] = managed_group_val
+                print(f"  Added '{pair_line}' to admin-managed_by_group.txt")
+            except Exception as e:
+                print(f"  \u26A0\ufe0f  Failed to update admin-managed_by_group file: {e}")
+
+    if cmdb.REMOTE_MODE and port_22_ok and (
+        cmdb.field_is_missing("sys_class_name", fields.get("sys_class_name")) or
+        cmdb.field_is_missing("os_version", fields.get("os_version"))
+    ):
+        uname_out, ok = cmdb.run_ssh_command(server, "uname -a", timeout=30)
+        if ok:
+            print("  uname check: pass")
+            if uname_out:
+                print(f"    OSVersion: {uname_out}")
+            print(f"    Script Version: {cmdb.VERSION}")
+        else:
+            print("  uname check: fail")
+            print(f"    Script Version: {cmdb.VERSION}")
+
+    run_apifix_tasks(
+        cmdb,
+        server,
+        apifix,
+        ping_ok,
+        classification_retired,
+        patch_id_x,
+        monitor_false,
+        classification_production,
+        arp_info,
+    )
+
+    if arp_old:
+        return 3
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+##########################################
+#          END CMDB-PRESTEPS             #
+##########################################
